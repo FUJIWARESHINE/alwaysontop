@@ -958,16 +958,31 @@ def draw_icon_rgba(px=32, accent=None):
     e = max(1, px // 22)
     gdi32.Ellipse(memdc, e, e, px - e, px - e)
 
-    # 图钉字形（白）
-    font = gdi32.CreateFontW(-_icon_f(px, 0.56), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0,
-                             5, 0, ICON_FONT)
-    gdi32.SelectObject(memdc, font)
-    gdi32.SetBkMode(memdc, TRANSPARENT)
-    gdi32.SetTextColor(memdc, rgb(255, 255, 255))
-    rc = RECT(0, _icon_f(px, 0.04), px, px)
-    user32.DrawTextW(memdc, ICO_PIN, -1, ctypes.byref(rc),
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-    gdi32.DeleteObject(font)
+    # 图钉（白色矢量图形）—— 不使用字体字形。
+    # 原因：GDI 在 32-bit DIB 上渲染字体时，抗锯齿会产生半透明像素；
+    # 而 ICO/XOR 的 alpha 处理会把它们误判为透明，导致小尺寸图标“撕裂”。
+    # 改用确定的矢量图形后，每个像素要么纯白（不透明）要么透明黑，各尺寸都清晰。
+    gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_PEN))
+    pin = gdi32.CreateSolidBrush(rgb(255, 255, 255))
+    gdi32.SelectObject(memdc, pin)
+    cx = px / 2.0
+    head_r = _icon_f(px, 0.24)          # 头圆半径
+    head_cy = _icon_f(px, 0.40)         # 头圆圆心 y
+    tip_y = _icon_f(px, 0.90)           # 针尖 y
+    w = _icon_f(px, 0.11)               # 针体半宽
+    # 圆头
+    gdi32.Ellipse(memdc, int(cx - head_r), int(head_cy - head_r),
+                  int(cx + head_r), int(head_cy + head_r))
+    # 针体（三角：从头部两侧收拢到针尖）
+    pts = (POINT * 3)(
+        POINT(int(cx - w), int(head_cy + head_r * 0.5)),
+        POINT(int(cx + w), int(head_cy + head_r * 0.5)),
+        POINT(int(cx), int(tip_y)),
+    )
+    gdi32.Polygon.argtypes = [ctypes.c_void_p, ctypes.POINTER(POINT), ctypes.c_int]
+    gdi32.Polygon.restype = ctypes.c_int
+    gdi32.Polygon(memdc, pts, 3)
+    gdi32.DeleteObject(pin)
 
     # 底部"置顶基线"
     base_pen = gdi32.CreatePen(0, max(1, px // 14), rgb(255, 255, 255))
@@ -983,17 +998,22 @@ def draw_icon_rgba(px=32, accent=None):
     gdi32.DeleteDC(memdc)
     user32.ReleaseDC(None, hdc_screen)
 
-    # GDI 不写 alpha → 手动补成不透明，并导出 RGBA 字节
+    # GDI 不写 alpha → 手动补成不透明，并导出 BGRA 字节。
+    # GDI 32-bit DIB 内存布局是 BGRA（最低字节是 B），不是 RGBA。
+    # ICO XOR mask 也是 BGRA 顺序，所以可以直接喂给 pack_ico。
     arr = ctypes.cast(bits, ctypes.POINTER(ctypes.c_uint32))
     buf = bytearray(px * px * 4)
     for i in range(px * px):
-        v = arr[i] & 0x00FFFFFF
+        v = arr[i] & 0x00FFFFFF  # 保留 BGR
         if v:
+            # 有颜色的像素：把 alpha 通道（最高字节）置为 0xFF（不透明）
             arr[i] = v | 0xFF000000
-        buf[i * 4] = arr[i] & 0xFF                # R
-        buf[i * 4 + 1] = (arr[i] >> 8) & 0xFF     # G
-        buf[i * 4 + 2] = (arr[i] >> 16) & 0xFF    # B
-        buf[i * 4 + 3] = (arr[i] >> 24) & 0xFF    # A
+        # 否则（透明黑）：arr[i] 保持 0，alpha=0（完全透明）
+        # 按 BGRA 顺序写入 buf（注意 +3 拿到的是 alpha 通道，无论 BGRA/RGBA 它都在 +3）
+        buf[i * 4]     = arr[i] & 0xFF             # B
+        buf[i * 4 + 1] = (arr[i] >> 8) & 0xFF      # G
+        buf[i * 4 + 2] = (arr[i] >> 16) & 0xFF     # R
+        buf[i * 4 + 3] = (arr[i] >> 24) & 0xFF     # A
     return bytes(buf)
 
 
@@ -1207,18 +1227,19 @@ def draw_button(dis):
 
 
 def draw_search_bg(dis):
-    """搜索框容器：圆角底 + 放大镜图标 + 占位文字"""
+    """搜索框容器（owner-draw STATIC）：圆角底 + 放大镜 + 占位文字"""
     t = theme()
     hdc = dis.hdc
     rc = dis.rcItem
     fill_rounded(hdc, rc, g['brushes']['field_bg'], g['pens']['border'], sc(4))
-    # 放大镜
     gdi32.SetBkMode(hdc, TRANSPARENT)
+    # 放大镜
     gdi32.SelectObject(hdc, g['fonts']['icon_sm'])
     gdi32.SetTextColor(hdc, t['text_dim'])
     ir = RECT(rc.left + sc(6), rc.top, rc.left + sc(26), rc.bottom)
     user32.DrawTextW(hdc, ICO_SEARCH, -1, ctypes.byref(ir),
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+    # 占位文字（仅在未输入时显示，通过透明 EDIT 透出）
     if not g['filter']:
         gdi32.SelectObject(hdc, g['fonts']['small'])
         gdi32.SetTextColor(hdc, t['text_dim'])
@@ -1351,9 +1372,11 @@ def layout():
     if search_w < sc(150):
         search_w = sc(150)  # 极窄时保底（最小窗口已保证足够）
     sx = (w - pad) - search_w
-    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH_BG], sx, sc(7), search_w, sc(28), True)
-    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH], sx + sc(28), sc(12),
-                      search_w - sc(38), sc(19), True)
+    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH_BG], sx, sc(10), search_w, sc(28), True)
+    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH], sx + sc(28), sc(15),
+                      search_w - sc(38), sc(18), True)
+    # 显式让搜索框容器重绘，保证 owner-draw 圆角背景一定绘制
+    user32.InvalidateRect(g['hwnd_btn'][ID_SEARCH_BG], None, True)
 
     # —— 行2：后台运行 / 置顶后转入后台（左对齐）——
     xx = pad
@@ -1432,7 +1455,8 @@ def wndproc(hwnd, msg, wparam, lparam):
             buf = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(g['hwnd_btn'][ID_SEARCH], buf, 256)
             g['filter'] = buf.value
-            user32.InvalidateRect(g['hwnd_btn'][ID_SEARCH_BG], None, True)
+            # 占位文字"搜索窗口"在有输入时要消失：使搜索框容器重绘
+            user32.InvalidateRect(g['hwnd_btn'].get(ID_SEARCH_BG), None, True)
             refresh()
             return 0
         if cid == ID_REFRESH:
@@ -1478,10 +1502,10 @@ def wndproc(hwnd, msg, wparam, lparam):
     if msg == WM_DRAWITEM:
         dis = ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents
         if dis.CtlType == ODT_BUTTON:
-            draw_button(dis)
-            return 1
-        if dis.CtlType == ODT_STATIC and dis.CtlID == ID_SEARCH_BG:
-            draw_search_bg(dis)
+            if dis.hwndItem == g['hwnd_btn'].get(ID_SEARCH_BG):
+                draw_search_bg(dis)
+            else:
+                draw_button(dis)
             return 1
         return 0
 
@@ -1692,8 +1716,14 @@ def main():
     g['hwnd_header'] = user32.SendMessageW(lv, LVM_GETHEADER, 0, 0)
     uxtheme.SetWindowTheme(g['hwnd_header'], "Explorer", None)
 
-    # 搜索框（静态容器 + 无边框编辑框）
-    mk("STATIC", None, SS_OWNERDRAW, ID_SEARCH_BG)
+    # 搜索框（owner-draw BUTTON 容器 + 透明 EDIT 输入框）
+    # 容器负责画圆角背景 + 放大镜 + 占位文字（EDIT 无边框、背景透明，浮在容器上）。
+    # 注意：用 BUTTON(BS_OWNERDRAW) 而非 STATIC(SS_OWNERDRAW)——
+    # Win32 中 owner-draw STATIC 不可靠（不触发/不绘制），且 WM_CTLCOLORSTATIC
+    # 对 owner-draw 控件不发消息，导致容器背景透明、后面 ListView 透出，
+    # 表现为“搜索框里看到列表文字”的重叠假象。BUTTON 的 owner-draw 在所有
+    # Windows 版本都稳定触发 WM_DRAWITEM，和工具栏按钮一致。
+    mk("BUTTON", None, BS_OWNERDRAW, ID_SEARCH_BG)
     mk("EDIT", None, ES_AUTOHSCROLL, ID_SEARCH)
     user32.SendMessageW(g['hwnd_btn'][ID_SEARCH], WM_SETFONT, g['fonts']['body'], 1)
 
