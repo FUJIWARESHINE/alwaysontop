@@ -5,7 +5,7 @@
 
 功能：
   · 类 Explorer 的列表视图（图标 + 标题 + 进程列，自绘选中/悬停圆角高亮）
-  · 顶部命令栏（图标按钮 + 搜索框）、底部状态栏
+  · 顶部命令栏（图标按钮）、底部状态栏
   · 随系统明暗主题自动切换配色
   · 点击「置顶」后自动转入后台，托盘图标常驻
   · 全局快捷键 Ctrl+Alt+T 切换前台窗口置顶 / Ctrl+Alt+M 显示隐藏主窗口
@@ -198,8 +198,6 @@ ID_TOGGLE = 101
 ID_REFRESH = 102
 ID_CLEAR = 103
 ID_TRAY = 104
-ID_SEARCH = 105
-ID_SEARCH_BG = 106
 ID_STATUS = 107
 ID_AUTOTRAY = 108
 IDM_SHOW = 2001
@@ -607,7 +605,7 @@ def get_accent():
 PALETTE_LIGHT = {
     'window': rgb(0xF3, 0xF3, 0xF3),
     'commandbar': rgb(0xFB, 0xFB, 0xFB),
-    'list_bg': rgb(0xFF, 0xFF, 0xFF),
+    'list_bg': rgb(0xEE, 0xEE, 0xEE),
     'list_border': rgb(0xE0, 0xE0, 0xE0),
     'header_bg': rgb(0xFB, 0xFB, 0xFB),
     'header_text': rgb(0x61, 0x61, 0x61),
@@ -626,7 +624,7 @@ PALETTE_LIGHT = {
 PALETTE_DARK = {
     'window': rgb(0x28, 0x28, 0x28),
     'commandbar': rgb(0x2B, 0x2B, 0x2B),
-    'list_bg': rgb(0x1F, 0x1F, 0x1F),
+    'list_bg': rgb(0x24, 0x24, 0x24),
     'list_border': rgb(0x3D, 0x3D, 0x3D),
     'header_bg': rgb(0x28, 0x28, 0x28),
     'header_text': rgb(0xB0, 0xB0, 0xB0),
@@ -787,13 +785,10 @@ def refresh():
     user32.SendMessageW(lv, LVM_DELETEALLITEMS, 0, 0)
     g['rows'] = []
 
-    filt = g['filter'].strip().lower()
     wins = enum_windows(g['hwnd_main'])
     new_sel = -1
     i = 0
     for hwnd, title, exe, path in wins:
-        if filt and (filt not in title.lower() and filt not in exe.lower()):
-            continue
         top = is_topmost(hwnd)
         g['rows'].append((hwnd, title, exe, path, top))
         img = icon_index_for_path(path)
@@ -921,100 +916,105 @@ def _icon_f(px, frac):
     return int(round(px * frac))
 
 
+def resource_path(name):
+    """定位未打包（脚本）或打包后（_MEIPASS / exe 目录）的资源文件。"""
+    import os, sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = [os.path.join(here, name)]
+    if getattr(sys, 'frozen', False):
+        cand.append(os.path.join(getattr(sys, '_MEIPASS', ''), name))
+        cand.append(os.path.join(os.path.dirname(sys.executable), name))
+    for c in cand:
+        if os.path.exists(c):
+            return c
+    return cand[0]
+
+
 def draw_icon_rgba(px=32, accent=None):
-    """绘制图标并返回顶向下 (top-down) 的 RGBA 字节串，供 HICON / .ico 共用。
-
-    视觉：强调色圆底 + 白色细描边环（深浅背景都清晰）+ 白色图钉
-    + 底部一条白色"置顶基线"。"""
-    accent = accent or g['accent']
-    hdc_screen = user32.GetDC(None)
-    bmi = BITMAPINFO()
-    head = bmi.bmiHeader
-    head.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    head.biWidth = px
-    head.biHeight = -px          # top-down
-    head.biPlanes = 1
-    head.biBitCount = 32
-    head.biCompression = BI_RGB
-    bits = ctypes.c_void_p()
-    hbm = gdi32.CreateDIBSection(hdc_screen, ctypes.byref(bmi), 0,
-                                 ctypes.byref(bits), None, 0)
-    if not hbm:
-        user32.ReleaseDC(None, hdc_screen)
+    """从预渲染高清 master (icon.png) 取图：mdi/pin 矢量图钉 + 抗锯齿合成到蓝圆底。
+    返回 top-down 的 BGRA（已 alpha 预乘），供 HICON / .ico 共用。
+    若 icon.png 缺失，回退到矢量手绘 _draw_icon_fallback。"""
+    try:
+        from PIL import Image
+    except Exception:
         return None
-    memdc = gdi32.CreateCompatibleDC(hdc_screen)
-    old = gdi32.SelectObject(memdc, hbm)
+    try:
+        p = resource_path('icon.png')
+        im = Image.open(p).convert('RGBA').resize((px, px), Image.LANCZOS)
+    except Exception:
+        return _draw_icon_fallback(px, accent)
+    raw = im.tobytes()  # RGBA top-down
+    n = len(raw) // 4
+    out = bytearray(n * 4)
+    for i in range(n):
+        r, g, b, a = raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]
+        out[i*4]     = b * a // 255   # BGRA（HICON 位图要求 BGR 顺序）
+        out[i*4 + 1] = g * a // 255
+        out[i*4 + 2] = r * a // 255
+        out[i*4 + 3] = a
+    return bytes(out)
 
-    # 圆底（强调色）
-    brush = gdi32.CreateSolidBrush(accent)
-    gdi32.SelectObject(memdc, brush)
-    gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_PEN))
-    gdi32.Ellipse(memdc, 0, 0, px, px)
 
-    # 白色细描边环
-    ring = gdi32.CreatePen(0, max(1, px // 16), rgb(255, 255, 255))
-    gdi32.SelectObject(memdc, ring)
-    gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_BRUSH))
-    e = max(1, px // 22)
-    gdi32.Ellipse(memdc, e, e, px - e, px - e)
-
-    # 图钉（白色矢量图形）—— 不使用字体字形。
-    # 原因：GDI 在 32-bit DIB 上渲染字体时，抗锯齿会产生半透明像素；
-    # 而 ICO/XOR 的 alpha 处理会把它们误判为透明，导致小尺寸图标“撕裂”。
-    # 改用确定的矢量图形后，每个像素要么纯白（不透明）要么透明黑，各尺寸都清晰。
-    gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_PEN))
-    pin = gdi32.CreateSolidBrush(rgb(255, 255, 255))
-    gdi32.SelectObject(memdc, pin)
-    cx = px / 2.0
-    head_r = _icon_f(px, 0.24)          # 头圆半径
-    head_cy = _icon_f(px, 0.40)         # 头圆圆心 y
-    tip_y = _icon_f(px, 0.90)           # 针尖 y
-    w = _icon_f(px, 0.11)               # 针体半宽
-    # 圆头
-    gdi32.Ellipse(memdc, int(cx - head_r), int(head_cy - head_r),
-                  int(cx + head_r), int(head_cy + head_r))
-    # 针体（三角：从头部两侧收拢到针尖）
-    pts = (POINT * 3)(
-        POINT(int(cx - w), int(head_cy + head_r * 0.5)),
-        POINT(int(cx + w), int(head_cy + head_r * 0.5)),
-        POINT(int(cx), int(tip_y)),
-    )
-    gdi32.Polygon.argtypes = [ctypes.c_void_p, ctypes.POINTER(POINT), ctypes.c_int]
-    gdi32.Polygon.restype = ctypes.c_int
-    gdi32.Polygon(memdc, pts, 3)
-    gdi32.DeleteObject(pin)
-
-    # 底部"置顶基线"
-    base_pen = gdi32.CreatePen(0, max(1, px // 14), rgb(255, 255, 255))
-    gdi32.SelectObject(memdc, base_pen)
-    yb = _icon_f(px, 0.80)
-    gdi32.MoveToEx(memdc, _icon_f(px, 0.20), yb, None)
-    gdi32.LineTo(memdc, _icon_f(px, 0.80), yb)
-    gdi32.DeleteObject(base_pen)
-    gdi32.DeleteObject(ring)
-    gdi32.DeleteObject(brush)
-
-    gdi32.SelectObject(memdc, old)
-    gdi32.DeleteDC(memdc)
-    user32.ReleaseDC(None, hdc_screen)
-
-    # GDI 不写 alpha → 手动补成不透明，并导出 BGRA 字节。
-    # GDI 32-bit DIB 内存布局是 BGRA（最低字节是 B），不是 RGBA。
-    # ICO XOR mask 也是 BGRA 顺序，所以可以直接喂给 pack_ico。
-    arr = ctypes.cast(bits, ctypes.POINTER(ctypes.c_uint32))
-    buf = bytearray(px * px * 4)
-    for i in range(px * px):
-        v = arr[i] & 0x00FFFFFF  # 保留 BGR
-        if v:
-            # 有颜色的像素：把 alpha 通道（最高字节）置为 0xFF（不透明）
-            arr[i] = v | 0xFF000000
-        # 否则（透明黑）：arr[i] 保持 0，alpha=0（完全透明）
-        # 按 BGRA 顺序写入 buf（注意 +3 拿到的是 alpha 通道，无论 BGRA/RGBA 它都在 +3）
-        buf[i * 4]     = arr[i] & 0xFF             # B
-        buf[i * 4 + 1] = (arr[i] >> 8) & 0xFF      # G
-        buf[i * 4 + 2] = (arr[i] >> 16) & 0xFF     # R
-        buf[i * 4 + 3] = (arr[i] >> 24) & 0xFF     # A
-    return bytes(buf)
+def _draw_icon_fallback(px=32, accent=None):
+    """矢量手绘回退（aggdraw 抗锯齿），仅当 icon.png 不可用时使用。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    accent = accent if accent is not None else g.get('accent', 0x2E7CF6)
+    aR, aG, aB = (accent >> 16) & 0xFF, (accent >> 8) & 0xFF, accent & 0xFF
+    BG = (aR, aG, aB, 255)
+    WHITE = (255, 255, 255, 255)
+    try:
+        import aggdraw
+        has_aa = True
+    except Exception:
+        has_aa = False
+    ss = px * 4 if has_aa else px * 16
+    img = Image.new('RGBA', (ss, ss), (0, 0, 0, 0))
+    if has_aa:
+        d = aggdraw.Draw(img)
+        b_bg = aggdraw.Brush(BG)
+        b_white = aggdraw.Brush(WHITE)
+        p_stroke = aggdraw.Pen(WHITE, max(1.0, ss / 48.0))
+        p_line = aggdraw.Pen(WHITE, max(1.0, ss / 28.0))
+        r = max(1.0, ss * 0.20)
+        d.rounded_rectangle([1.0, 1.0, ss - 2.0, ss - 2.0], r, p_stroke, b_bg)
+        head_r = ss * 0.20
+        head_cy = ss * 0.40
+        cx = ss / 2.0
+        d.ellipse([cx - head_r, head_cy - head_r, cx + head_r, head_cy + head_r], None, b_white)
+        w = ss * 0.09
+        d.polygon([cx - w, head_cy + head_r * 0.4,
+                   cx + w, head_cy + head_r * 0.4,
+                   cx, ss * 0.76], None, b_white)
+        d.line([ss * 0.22, ss * 0.80, ss * 0.78, ss * 0.80], p_line)
+        d.flush()
+    else:
+        from PIL import ImageDraw
+        d = ImageDraw.Draw(img)
+        r = max(1, int(ss * 0.20))
+        d.rounded_rectangle([1, 1, ss - 2, ss - 2], radius=r, fill=BG)
+        d.rounded_rectangle([1, 1, ss - 2, ss - 2], radius=r,
+                            outline=WHITE, width=max(1, ss // 48))
+        head_r = ss * 0.20
+        head_cy = ss * 0.40
+        cx = ss / 2.0
+        d.ellipse([cx - head_r, head_cy - head_r, cx + head_r, head_cy + head_r], fill=WHITE)
+        w = ss * 0.09
+        d.polygon([(cx - w, head_cy + head_r * 0.4),
+                   (cx + w, head_cy + head_r * 0.4),
+                   (cx, ss * 0.76)], fill=WHITE)
+        d.line([ss * 0.22, ss * 0.80, ss * 0.78, ss * 0.80], fill=WHITE, width=max(1, ss // 28))
+    img = img.resize((px, px), Image.LANCZOS)
+    raw = img.tobytes()
+    out = bytearray(len(raw))
+    for i in range(0, len(raw), 4):
+        out[i]     = raw[i + 2]
+        out[i + 1] = raw[i + 1]
+        out[i + 2] = raw[i]
+        out[i + 3] = raw[i + 3]
+    return bytes(out)
 
 
 def draw_icon_hicon(px=32, accent=None):
@@ -1226,28 +1226,6 @@ def draw_button(dis):
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
 
-def draw_search_bg(dis):
-    """搜索框容器（owner-draw STATIC）：圆角底 + 放大镜 + 占位文字"""
-    t = theme()
-    hdc = dis.hdc
-    rc = dis.rcItem
-    fill_rounded(hdc, rc, g['brushes']['field_bg'], g['pens']['border'], sc(4))
-    gdi32.SetBkMode(hdc, TRANSPARENT)
-    # 放大镜
-    gdi32.SelectObject(hdc, g['fonts']['icon_sm'])
-    gdi32.SetTextColor(hdc, t['text_dim'])
-    ir = RECT(rc.left + sc(6), rc.top, rc.left + sc(26), rc.bottom)
-    user32.DrawTextW(hdc, ICO_SEARCH, -1, ctypes.byref(ir),
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-    # 占位文字（仅在未输入时显示，通过透明 EDIT 透出）
-    if not g['filter']:
-        gdi32.SelectObject(hdc, g['fonts']['small'])
-        gdi32.SetTextColor(hdc, t['text_dim'])
-        tr = RECT(rc.left + sc(26), rc.top, rc.right - sc(6), rc.bottom)
-        user32.DrawTextW(hdc, "搜索窗口", -1, ctypes.byref(tr),
-                         DT_LEFT | DT_VCENTER | DT_SINGLELINE)
-
-
 def draw_list_item(lplvcd):
     """ListView 行自绘：圆角选中/悬停块 + 图标 + 文字"""
     cd = lplvcd.contents
@@ -1291,11 +1269,11 @@ def draw_list_item(lplvcd):
             if iimg >= 0 and g.get('himl'):
                 iy = rc.top + ((rc.bottom - rc.top) - sc(16)) // 2
                 comctl32.ImageList_Draw(g['himl'], iimg, hdc,
-                                        rc.left + sc(6), iy, 0)
+                                        rc.left + sc(12), iy, 0)
             # 标题
             gdi32.SelectObject(hdc, g['fonts']['body'])
             gdi32.SetTextColor(hdc, t['text'])
-            tr = RECT(rc.left + sc(28), rc.top, rc.right - sc(8), rc.bottom)
+            tr = RECT(rc.left + sc(34), rc.top, rc.right - sc(8), rc.bottom)
             user32.DrawTextW(hdc, title, -1, ctypes.byref(tr),
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                              DT_END_ELLIPSIS | DT_NOPREFIX)
@@ -1367,17 +1345,6 @@ def layout():
         user32.MoveWindow(g['hwnd_btn'][cid], x, y1, bwv, r1h, True)
         x += bwv + sc(6)
 
-    # —— 行1：搜索框填满剩余右侧（宽度自适应，避免重叠）——
-    search_w = (w - pad) - x
-    if search_w < sc(150):
-        search_w = sc(150)  # 极窄时保底（最小窗口已保证足够）
-    sx = (w - pad) - search_w
-    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH_BG], sx, sc(10), search_w, sc(28), True)
-    user32.MoveWindow(g['hwnd_btn'][ID_SEARCH], sx + sc(28), sc(15),
-                      search_w - sc(38), sc(18), True)
-    # 显式让搜索框容器重绘，保证 owner-draw 圆角背景一定绘制
-    user32.InvalidateRect(g['hwnd_btn'][ID_SEARCH_BG], None, True)
-
     # —— 行2：后台运行 / 置顶后转入后台（左对齐）——
     xx = pad
     for cid, bwv in ((ID_TRAY, sc(96)), (ID_AUTOTRAY, sc(160))):
@@ -1385,8 +1352,8 @@ def layout():
         xx += bwv + sc(6)
 
     # —— 列表 ——
-    lv_y = cmd_h
-    lv_h = h - cmd_h - status_h - pad
+    lv_y = cmd_h + sc(4)
+    lv_h = h - lv_y - status_h - pad
     if lv_h < sc(120):
         lv_h = sc(120)
     user32.MoveWindow(g['hwnd_list'], pad, lv_y, w - pad * 2, lv_h, True)
@@ -1422,7 +1389,7 @@ def wndproc(hwnd, msg, wparam, lparam):
         except Exception:
             g['scale'] = 1.0
         g['dark'] = not is_light_theme()
-        g['accent'] = get_accent()
+        g['accent'] = 0x2E7CF6  # 固定蓝色强调色（与图标一致），不再跟随系统橘色
         make_resources()
         create_fonts(g['scale'])
 
@@ -1451,14 +1418,6 @@ def wndproc(hwnd, msg, wparam, lparam):
     if msg == WM_COMMAND:
         cid = wparam & 0xFFFF
         notify = (wparam >> 16) & 0xFFFF
-        if cid == ID_SEARCH and notify == 0x0400:  # EN_CHANGE
-            buf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(g['hwnd_btn'][ID_SEARCH], buf, 256)
-            g['filter'] = buf.value
-            # 占位文字"搜索窗口"在有输入时要消失：使搜索框容器重绘
-            user32.InvalidateRect(g['hwnd_btn'].get(ID_SEARCH_BG), None, True)
-            refresh()
-            return 0
         if cid == ID_REFRESH:
             refresh()
             set_hint("列表已刷新")
@@ -1502,10 +1461,7 @@ def wndproc(hwnd, msg, wparam, lparam):
     if msg == WM_DRAWITEM:
         dis = ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents
         if dis.CtlType == ODT_BUTTON:
-            if dis.hwndItem == g['hwnd_btn'].get(ID_SEARCH_BG):
-                draw_search_bg(dis)
-            else:
-                draw_button(dis)
+            draw_button(dis)
             return 1
         return 0
 
@@ -1565,7 +1521,7 @@ def wndproc(hwnd, msg, wparam, lparam):
         rc = RECT()
         user32.GetClientRect(hwnd, ctypes.byref(rc))
         # 命令栏与列表之间的分隔线
-        y = sc(74)
+        y = sc(82)
         old = gdi32.SelectObject(hdc, g['pens']['divider'])
         gdi32.MoveToEx(hdc, 0, y, None)
         gdi32.LineTo(hdc, rc.right, y)
@@ -1687,7 +1643,7 @@ def main():
     # 列表（ListView，report 视图）
     lv = user32.CreateWindowExW(
         0, WC_LISTVIEW, None,
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_BORDER |
         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         0, 0, 10, 10, hwnd_main, ID_LIST, hinst, None)
     g['hwnd_list'] = lv
@@ -1716,16 +1672,7 @@ def main():
     g['hwnd_header'] = user32.SendMessageW(lv, LVM_GETHEADER, 0, 0)
     uxtheme.SetWindowTheme(g['hwnd_header'], "Explorer", None)
 
-    # 搜索框（owner-draw BUTTON 容器 + 透明 EDIT 输入框）
-    # 容器负责画圆角背景 + 放大镜 + 占位文字（EDIT 无边框、背景透明，浮在容器上）。
-    # 注意：用 BUTTON(BS_OWNERDRAW) 而非 STATIC(SS_OWNERDRAW)——
-    # Win32 中 owner-draw STATIC 不可靠（不触发/不绘制），且 WM_CTLCOLORSTATIC
-    # 对 owner-draw 控件不发消息，导致容器背景透明、后面 ListView 透出，
-    # 表现为“搜索框里看到列表文字”的重叠假象。BUTTON 的 owner-draw 在所有
-    # Windows 版本都稳定触发 WM_DRAWITEM，和工具栏按钮一致。
-    mk("BUTTON", None, BS_OWNERDRAW, ID_SEARCH_BG)
-    mk("EDIT", None, ES_AUTOHSCROLL, ID_SEARCH)
-    user32.SendMessageW(g['hwnd_btn'][ID_SEARCH], WM_SETFONT, g['fonts']['body'], 1)
+
 
     # 状态栏
     g['hwnd_status'] = user32.CreateWindowExW(
