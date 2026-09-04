@@ -33,18 +33,3 @@
 - **独占全屏（exclusive fullscreen）** 游戏会独占整个显示输出，置顶窗口也会被盖住。
   请改用 **无边框全屏 / 窗口化全屏**（现在绝大多数游戏都支持），置顶才生效。
   这是 Windows 显示机制的硬限制，不是 bug。
-
-## 想改快捷键 / 重新打包？
-- 源码在同目录 `ontop.py`（纯 Win32 + ctypes，零第三方依赖）。
-- 改 `VK_T` / `VK_M`（按键）、`MOD_CONTROL | MOD_ALT`（修饰键）即可换快捷键。
-- 重新打包（需本机有 Python + PyInstaller）：
-  `python gen_icon.py && python -m PyInstaller --onefile --windowed --name AlwaysOnTop --icon icon.ico ontop.py`
-  产物在 `dist/AlwaysOnTop.exe`，可自行改名为中文。
-
-## 文件
-- `dist/置顶小工具.exe`：可直接运行的程序（约 7.5MB，已内嵌 Python 运行时）。
-  任务栏按钮和 exe 文件本身都带有自定义「图钉」图标。
-- `ontop.py`：当前版源码（Win11 Fluent UI + 托盘后台 + 窗口/任务栏图标）。
-- `icon.ico`：嵌入 exe 的多尺寸图标（16/24/32/48/64/128/256）。
-- `gen_icon.py`：图标生成脚本（复用 ontop 绘制，输出标准 ICO）。
-- `ontop_v1_backup.py`：旧版（简陋列表）源码备份，可对照或回退。
