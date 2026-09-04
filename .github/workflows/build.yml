@@ -28,14 +28,15 @@ jobs:
           pip install pyinstaller pillow aggdraw
 
       # 下载 UPX 并加入 PATH，供 PyInstaller 压缩体积（GitHub 运行器默认不带 UPX）
+      # 注意：Windows runner 的 bash 里 tar 是 GNU tar，不能解 .zip，故用 PowerShell 的 Expand-Archive
       - name: Install UPX
-        shell: bash
+        shell: pwsh
         run: |
-          curl -L -o upx.zip https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip
-          mkdir upx
-          tar -xf upx.zip -C upx
-          UPX_DIR=$(find "$PWD/upx" -name upx.exe -exec dirname {} \; | head -1)
-          echo "$UPX_DIR" >> "$GITHUB_PATH"
+          Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
+          Expand-Archive -Path upx.zip -DestinationPath upx_tmp -Force
+          $upxDir = (Get-ChildItem -Path upx_tmp -Recurse -Filter upx.exe | Select-Object -First 1).DirectoryName
+          Add-Content -Path $env:GITHUB_PATH -Value $upxDir
+          upx --version
 
       # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
       - name: Build exes
