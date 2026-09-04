@@ -35,8 +35,9 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
           Expand-Archive -Path upx.zip -DestinationPath upx_tmp -Force
           $upxDir = (Get-ChildItem -Path upx_tmp -Recurse -Filter upx.exe | Select-Object -First 1).DirectoryName
-          Add-Content -Path $env:GITHUB_PATH -Value $upxDir
-          upx --version
+          if (-not $upxDir) { throw "UPX 解压后未找到 upx.exe" }
+          Add-Content -Path $env:GITHUB_PATH -Value $upxDir -Encoding utf8
+          Write-Host "UPX dir: $upxDir"
 
       # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
       - name: Build exes
