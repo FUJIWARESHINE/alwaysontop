@@ -1,0 +1,59 @@
+name: Build & Release
+
+# 触发：推送到 main 自动构建并发布；也支持手动触发
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 发布 release / 打 tag 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow aggdraw
+
+      # 下载 UPX 并加入 PATH，供 PyInstaller 压缩体积（GitHub 运行器默认不带 UPX）
+      - name: Install UPX
+        shell: bash
+        run: |
+          curl -L -o upx.zip https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip
+          mkdir upx
+          tar -xf upx.zip -C upx
+          UPX_DIR=$(find "$PWD/upx" -name upx.exe -exec dirname {} \; | head -1)
+          echo "$UPX_DIR" >> "$GITHUB_PATH"
+
+      # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
+      - name: Build exes
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop --icon icon.ico --add-data "icon.png;." --hidden-import PIL --hidden-import aggdraw --exclude-module PIL._avif --exclude-module PIL._webp --exclude-module PIL._imagingcms --exclude-module PIL._imagingft --exclude-module PIL._imagingtk ontop.py
+          mkdir release
+          copy dist\AlwaysOnTop.exe release\AlwaysOnTop.exe
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico --add-data "icon.png;." --hidden-import PIL --hidden-import aggdraw --exclude-module PIL._avif --exclude-module PIL._webp --exclude-module PIL._imagingcms --exclude-module PIL._imagingft --exclude-module PIL._imagingtk ontop.py
+          copy dist\AlwaysOnTop_v2.exe release\AlwaysOnTop_v2.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/AlwaysOnTop.exe
+            release/AlwaysOnTop_v2.exe
