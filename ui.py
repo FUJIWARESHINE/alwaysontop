@@ -1,561 +1,595 @@
 # -*- coding: utf-8 -*-
-"""ui.py —— 自绘界面：布局、流光背景、玻璃卡片、控件、命中测试。
+"""ui.py —— 界面层：布局、玻璃面板、控件绘制、命中测试
 
-全部在主窗口的客户区里手绘，不使用 ListView / Button 等子控件，
-因此可以自由做圆角、渐变、玻璃层次。
+结构对齐「文件批量重命名」：
+  titlebar（logo + 应用名 + 右侧工具按钮 + 窗口按钮）
+  toolbar（主操作按钮 / 次要按钮 / 右侧搜索框）
+  panel（窗口列表卡片）
+  statusbar（左侧提示 / 右侧统计）
+  menu（右上角三条杠唤出的设置菜单，浮层）
+
+全部绘制落在 aurora.Canvas 上（半透明合成由画布自己完成），
+仅搜索框用真实 EDIT 子控件以支持输入法。
 """
 import ctypes
 import math
 import time
 
 import theme as T
-from aurora import (Aurora, RECT, rgb, mix, lighten, darken, fill_rect,
-                    fill_round, blend_round, stroke_round, fill_round_grad,
-                    hgradient_rect, text, measure, line, ellipse, user32, gdi32,
-                    NULL_BRUSH, NULL_PEN)
+from aurora import (Aurora, Canvas, RECT, rgb, mix, lighten, darken, fill_rect,
+                    fill_round, grad_round, text, measure, line, ellipse,
+                    user32, gdi32,
+                    DT_LEFT, DT_CENTER, DT_RIGHT, DT_VCENTER, DT_SINGLELINE,
+                    DT_END_ELLIPSIS, DT_NOPREFIX)
 
-DT_LEFT = 0x0000
-DT_CENTER = 0x0001
-DT_RIGHT = 0x0002
-DT_VCENTER = 0x0004
-DT_SINGLELINE = 0x0020
-DT_END_ELLIPSIS = 0x8000
-DT_NOPREFIX = 0x0800
+# 布局常量（96 DPI 下的 CSS px）
+TITLEBAR_H = 46
+TOOLBAR_H = 54
+STATUSBAR_H = 28
+PAD = 14
+LOGO = 26
+WINBTN_W, WINBTN_H = 34, 30
+BTN_H = 34
+BTN_R = 11
+ROW_H = 46
+ICON_SZ = 20
+MENU_W = 220
+MENU_ITEM_H = 30
+MENU_SEP_H = 10
+MENU_PAD = 5
 
 
 def _rc(l, t, r, b):
     return RECT(int(l), int(t), int(r), int(b))
 
 
-def _hit(x, y, rc):
+def _inside(x, y, rc):
     return rc.left <= x < rc.right and rc.top <= y < rc.bottom
 
 
 class UI:
-    """主窗口的界面层。"""
-
     def __init__(self, app):
         self.app = app
         self.aurora = Aurora()
-        self.hit_regions = []      # [(kind, RECT, payload)]
+        self.hits = []              # [(kind, RECT, payload)]
+        self.menu_hits = []         # [(item_index, RECT)]
 
     # ------------------------------------------------------------ 主题
     def pal(self):
-        return T.DARK if self.app.g['dark'] else T.LIGHT
+        return T.palette(self.app.g['dark'])
 
     def apply_theme(self):
-        g = self.app.g
-        dark = g['dark']
-        self.aurora.set_colors(T.aurora_blobs(dark),
-                               base=self.pal()['aurora_base'])
+        p = self.pal()
+        self.aurora.set_colors(p['glow'], p['glow_base'])
 
     # ------------------------------------------------------------ 布局
     def layout(self, w, h):
-        """计算所有区域的矩形，写入 g['layout'] 并记录命中区。"""
         g = self.app.g
         sc = self.app.sc
-        pal = self.pal()
-        pad = sc(20)
+
+        tb_h = sc(TITLEBAR_H)
+        toolbar_h = sc(TOOLBAR_H)
+        status_h = sc(STATUSBAR_H)
+        pad = sc(PAD)
+        bw, bh = sc(WINBTN_W), sc(WINBTN_H)
+
+        L = {'w': w, 'h': h, 'pad': pad, 'titlebar_h': tb_h,
+             'toolbar_h': toolbar_h, 'statusbar_h': status_h}
 
         # —— 标题栏 ——
-        cap_h = sc(46)
-        close_w = sc(46)
-        min_w = sc(40)
+        L['titlebar'] = _rc(0, 0, w, tb_h)
+        lg = sc(LOGO)
+        L['logo'] = _rc(pad, (tb_h - lg) // 2, pad + lg, (tb_h - lg) // 2 + lg)
+        bx = L['logo'].right + sc(10)
+        L['brand'] = _rc(bx, sc(6), bx + sc(260), sc(6) + sc(18))
+        L['brand_sub'] = _rc(bx, sc(24), bx + sc(300), sc(24) + sc(16))
 
-        # —— 顶部标题区（大标题 + 副标题）——
-        head_y = cap_h + sc(6)
-        head_h = sc(56)
+        # 窗口按钮（最右）
+        rx = w - sc(6)
+        L['close'] = _rc(rx - bw, (tb_h - bh) // 2, rx, (tb_h - bh) // 2 + bh)
+        rx = L['close'].left - sc(2)
+        L['max'] = _rc(rx - bw, L['close'].top, rx, L['close'].bottom)
+        rx = L['max'].left - sc(2)
+        L['min'] = _rc(rx - bw, L['close'].top, rx, L['close'].bottom)
+        # 工具按钮（窗口按钮左侧）
+        rx = L['min'].left - sc(8)
+        L['menu_btn'] = _rc(rx - bw, L['close'].top, rx, L['close'].bottom)
+        rx = L['menu_btn'].left - sc(2)
+        L['theme_btn'] = _rc(rx - bw, L['close'].top, rx, L['close'].bottom)
 
-        # —— 主操作行 ——
-        act_y = head_y + head_h + sc(10)
-        act_h = sc(38)
-        btn_r = act_h // 2
-
-        # —— 搜索框（与操作行同高，靠右）——
-        search_w = sc(230)
-
-        # —— 设置卡片（开关区）——
-        set_y = act_y + act_h + sc(12)
-        set_h = sc(62)
-
-        # —— 列表卡片 ——
-        list_y = set_y + set_h + sc(12)
-        foot_h = sc(26)
-        list_h = max(sc(120), h - list_y - foot_h - sc(8))
-        list_r = _rc(pad, list_y, w - pad, list_y + list_h)
-
-        # —— 底部状态 ——
-        foot_y = list_y + list_h + sc(6)
-
-        L = {
-            'cap_h': cap_h,
-            'close': _rc(w - close_w, 0, w, cap_h),
-            'min': _rc(w - close_w - min_w, 0, w - close_w, cap_h),
-            'head': _rc(pad, head_y, w - pad, head_y + head_h),
-            'act_y': act_y, 'act_h': act_h, 'btn_r': btn_r,
-            'set': _rc(pad, set_y, w - pad, set_y + set_h),
-            'list': list_r,
-            'foot': _rc(pad, foot_y, w - pad, foot_y + foot_h),
-            'pad': pad,
-        }
-
-        # —— 操作行按钮（从左往右排）——
+        # —— 工具栏 ——
+        ty = tb_h
+        L['toolbar'] = _rc(0, ty, w, ty + toolbar_h)
+        by = ty + (toolbar_h - sc(BTN_H)) // 2
         x = pad
-        bw_toggle = sc(126)
-        bw_small = sc(42)
-        gap = sc(8)
-        L['btn_toggle'] = _rc(x, act_y, x + bw_toggle, act_y + act_h)
-        x += bw_toggle + gap
-        L['btn_refresh'] = _rc(x, act_y, x + bw_small, act_y + act_h)
-        x += bw_small + gap
-        L['btn_clear'] = _rc(x, act_y, x + bw_small, act_y + act_h)
-        # 搜索框靠右
-        L['search'] = _rc(w - pad - search_w, act_y,
-                          w - pad, act_y + act_h)
+        L['btn_toggle'] = _rc(x, by, x + sc(132), by + sc(BTN_H))
+        x = L['btn_toggle'].right + sc(8)
+        L['btn_refresh'] = _rc(x, by, x + sc(88), by + sc(BTN_H))
+        x = L['btn_refresh'].right + sc(8)
+        L['btn_clear'] = _rc(x, by, x + sc(114), by + sc(BTN_H))
+        # 搜索框靠右；窄窗口时收缩，保证不与按钮重叠
+        sw = sc(232)
+        sx = w - pad - sw
+        min_sx = L['btn_clear'].right + sc(10)
+        if sx < min_sx:
+            sx = min_sx
+            sw = max(sc(110), w - pad - sx)
+        L['search'] = _rc(sx, by, sx + sw, by + sc(BTN_H))
+        L['search_edit'] = _rc(sx + sc(34), by + sc(1), sx + sw - sc(10),
+                              by + sc(BTN_H) - sc(1))
 
-        # —— 设置卡片里的两个开关 ——
-        sw_w = sc(210)
-        inner_x = L['set'].left + sc(16)
-        row_h = sc(26)
-        r1_y = L['set'].top + sc(7)
-        L['sw_autotray'] = _rc(w - pad - sc(16) - sw_w, r1_y,
-                               w - pad - sc(16), r1_y + row_h)
-        L['sw_autostart'] = _rc(w - pad - sc(16) - sw_w, r1_y + row_h + sc(2),
-                                w - pad - sc(16), r1_y + row_h * 2 + sc(2))
-        # 左侧说明文字
-        L['set_label'] = _rc(inner_x, L['set'].top + sc(8),
-                             L['sw_autotray'].left - sc(16),
-                             L['set'].top + sc(8) + sc(46))
+        # —— 面板（列表卡片）——
+        py = ty + toolbar_h + sc(12)
+        foot_y = h - status_h
+        list_h = max(sc(110), foot_y - py - sc(14))
+        L['list'] = _rc(pad, py, w - pad, py + list_h)
+        head_h = sc(34)
+        L['list_head'] = _rc(L['list'].left, L['list'].top,
+                             L['list'].right, L['list'].top + head_h)
+        L['list_inner'] = _rc(L['list'].left + sc(1),
+                              L['list'].top + head_h + sc(1),
+                              L['list'].right - sc(1),
+                              L['list'].bottom - sc(1))
+        L['row_h'] = sc(ROW_H)
+        L['list_h'] = L['list_inner'].bottom - L['list_inner'].top
 
-        # —— 列表内部 ——
-        lr = L['list']
-        row_h_item = sc(50)
-        head_h_item = sc(32)
-        L['row_h'] = row_h_item
-        L['list_head_h'] = head_h_item
-        L['list_inner'] = _rc(lr.left + sc(1), lr.top + head_h_item,
-                              lr.right - sc(1), lr.bottom - sc(1))
-        L['list_h'] = L['list_inner'].bottom - L['list_inner'].top - sc(4)
-        # 列表标题栏里的计数
-        L['count'] = _rc(lr.left + sc(14), lr.top + 1,
-                         lr.right - sc(14), lr.top + head_h_item)
+        # —— 状态栏 ——
+        L['statusbar'] = _rc(0, foot_y, w, h)
+        L['status_left'] = _rc(pad, foot_y, w // 2, h)
+        L['status_right'] = _rc(w // 2, foot_y, w - pad, h)
 
         g['layout'] = L
         self._build_hits(L)
+        self._layout_menu(L)
         self.app.clamp_scroll()
         return L
 
-    def _build_hits(self, L):
+    def _layout_menu(self, L):
+        g = self.app.g
         sc = self.app.sc
-        H = []
-        H.append((self.app.HIT_CLOSE, L['close'], None))
-        H.append((self.app.HIT_MIN, L['min'], None))
-        H.append((self.app.HIT_TITLE, _rc(0, 0, L['list'].right - sc(120),
-                                          L['cap_h']), None))
-        H.append((self.app.HIT_TOGGLE, L['btn_toggle'], None))
-        H.append((self.app.HIT_REFRESH, L['btn_refresh'], None))
-        H.append((self.app.HIT_CLEAR, L['btn_clear'], None))
-        H.append((self.app.HIT_AUTOTRAY, L['sw_autotray'], None))
-        H.append((self.app.HIT_AUTOSTART, L['sw_autostart'], None))
-        H.append((self.app.HIT_SCROLL, L['list_inner'], None))
-        self.hit_regions = H
+        self.menu_hits = []
+        if not g.get('menu_open'):
+            L['menu'] = None
+            return
+        items = self.menu_items()
+        w = sc(MENU_W)
+        pad = sc(MENU_PAD)
+        body = sum(sc(MENU_SEP_H) if it.get('sep') else sc(MENU_ITEM_H)
+                   for it in items)
+        h = body + pad * 2
+        x = max(sc(6), min(L['menu_btn'].right - w, L['w'] - w - sc(6)))
+        y = L['titlebar'].bottom + sc(6)
+        L['menu'] = _rc(x, y, x + w, y + h)
+
+        cy = y + pad
+        for i, it in enumerate(items):
+            ih = sc(MENU_SEP_H) if it.get('sep') else sc(MENU_ITEM_H)
+            if not it.get('sep'):
+                self.menu_hits.append(
+                    (i, _rc(x + pad, cy, x + w - pad, cy + ih)))
+            cy += ih
+
+    def _build_hits(self, L):
+        A = self.app
+        self.hits = [
+            (A.HIT_CLOSE, L['close'], None),
+            (A.HIT_MAX, L['max'], None),
+            (A.HIT_MIN, L['min'], None),
+            (A.HIT_MENUBTN, L['menu_btn'], None),
+            (A.HIT_THEME, L['theme_btn'], None),
+            (A.HIT_TOGGLE, L['btn_toggle'], None),
+            (A.HIT_REFRESH, L['btn_refresh'], None),
+            (A.HIT_CLEAR, L['btn_clear'], None),
+            (A.HIT_SCROLL, L['list_inner'], None),
+        ]
+
+    # ------------------------------------------------------------ 菜单模型
+    def menu_items(self):
+        g = self.app.g
+        return [
+            {'id': 'autostart', 'icon': T.ICO_POWER, 'text': '开机自启',
+             'switch': g['autostart']},
+            {'id': 'autotray', 'icon': T.ICO_MIN, 'text': '置顶后转入后台',
+             'switch': g['autotray']},
+            {'sep': True},
+            {'id': 'theme',
+             'icon': T.ICO_MOON if g['dark'] else T.ICO_SUN,
+             'text': '浅色主题' if g['dark'] else '深色主题'},
+            {'id': 'refresh', 'icon': T.ICO_REFRESH, 'text': '刷新列表'},
+            {'id': 'clear', 'icon': T.ICO_CLEAR, 'text': '取消全部置顶'},
+            {'sep': True},
+            {'id': 'help', 'icon': T.ICO_CHECK, 'text': '快捷键说明',
+             'note': 'Ctrl+Alt+T'},
+            {'id': 'tray', 'icon': T.ICO_MIN, 'text': '收进托盘运行'},
+            {'id': 'exit', 'icon': T.ICO_CLOSE, 'text': '退出'},
+        ]
 
     # ------------------------------------------------------------ 命中测试
     def hit_test(self, x, y):
-        for kind, rc, payload in self.hit_regions:
-            if _hit(x, y, rc):
+        if self.app.g.get('menu_open'):
+            for idx, rc in self.menu_hits:
+                if _inside(x, y, rc):
+                    return self.app.HIT_MENU, idx, rc
+            return self.app.HIT_MENUCANCEL, None, None
+        for kind, rc, payload in self.hits:
+            if _inside(x, y, rc):
                 return kind, payload, rc
         return self.app.HIT_NONE, None, None
 
     def row_at(self, y):
-        """屏幕 y -> 行索引（考虑滚动）。"""
         g = self.app.g
         L = g['layout']
         inner = L['list_inner']
         if not (inner.top <= y < inner.bottom):
             return -1
-        rh = L['row_h']
-        idx = (y - inner.top + g['scroll']) // rh
-        if 0 <= idx < len(g['rows']):
-            return idx
-        return -1
+        idx = (y - inner.top + g['scroll']) // L['row_h']
+        return idx if 0 <= idx < len(g['rows']) else -1
 
-    # ------------------------------------------------------------ 绘制
-    def paint(self, hdc, w, h):
+    # ------------------------------------------------------------ 绘制入口
+    def paint(self, cv, w, h):
         g = self.app.g
-        pal = self.pal()
+        p = self.pal()
         L = g['layout']
-        t = (time_now() - g['t0'])
+        t = time.time() - g['t0']
 
-        # 1) 流光背景
-        self.aurora.render(hdc, w, h, w=56, h=38, t=t)
+        self.aurora.render(cv.hdc, w, h, w=88, h=60, t=t)
+        self._app_border(cv, L, p)
+        self._titlebar(cv, L, p)
+        self._toolbar(cv, L, p)
+        self._list(cv, L, p)
+        self._statusbar(cv, L, p)
+        self._menu(cv, L, p)
 
-        # 2) 顶部轻微暗角，让标题更清晰
-        self._draw_header(hdc, L, pal)
+    def _hline(self, cv, x1, x2, y, c):
+        cv.blend_rect(_rc(x1, y, x2, y + 1), c[0], c[1])
 
-        # 3) 标题栏按钮
-        self._draw_caption(hdc, L, pal)
+    def _app_border(self, cv, L, p):
+        c = p['app_border']
+        w, h = L['w'], L['h']
+        cv.blend_rect(_rc(0, 0, w, 1), c[0], c[1])
+        cv.blend_rect(_rc(0, h - 1, w, h), c[0], c[1])
+        cv.blend_rect(_rc(0, 0, 1, h), c[0], c[1])
+        cv.blend_rect(_rc(w - 1, 0, w, h), c[0], c[1])
 
-        # 4) 操作行
-        self._draw_actions(hdc, L, pal)
-
-        # 5) 设置卡片
-        self._draw_settings(hdc, L, pal)
-
-        # 6) 列表卡片
-        self._draw_list(hdc, L, pal)
-
-        # 7) 底部状态
-        self._draw_footer(hdc, L, pal)
-
-    # ---------------------------------------------------- 标题区
-    def _draw_header(self, hdc, L, pal):
+    # ---------------------------------------------------- 标题栏
+    def _titlebar(self, cv, L, p):
         g = self.app.g
         sc = self.app.sc
-        r = L['head']
-        text(hdc, g['font_cache']['h1'], pal['text'],
-             r.left, r.top + sc(2), r.right - r.left, sc(28), "窗口置顶")
-        text(hdc, g['font_cache']['small'], pal['text_dim'],
-             r.left + sc(1), r.top + sc(30), r.right - r.left, sc(18),
-             "把任意窗口钉在最上层 · Ctrl+Alt+T 快速切换")
+        F = g['font_cache']
+        rc = L['titlebar']
 
-    def _draw_caption(self, hdc, L, pal):
+        c = p['titlebar']
+        cv.blend_rect(rc, c[0], c[1])
+        self._hline(cv, 0, L['w'], rc.bottom - 1, p['stroke'])
+
+        lg = L['logo']
+        grad_round(cv.hdc, lg, p['brand'], p['brand_2'], sc(8))
+        text(cv.hdc, F['icon'], rgb(255, 255, 255), lg.left, lg.top,
+             lg.right - lg.left, lg.bottom - lg.top, T.ICO_PIN,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+
+        text(cv.hdc, F['brand'], p['fg'], L['brand'].left, L['brand'].top,
+             L['brand'].right - L['brand'].left,
+             L['brand'].bottom - L['brand'].top, "窗口置顶")
+        text(cv.hdc, F['brand_sub'], p['fg_mute'], L['brand_sub'].left,
+             L['brand_sub'].top, L['brand_sub'].right - L['brand_sub'].left,
+             L['brand_sub'].bottom - L['brand_sub'].top, "把任意窗口钉在最上层")
+
+        self._winbtn(cv, L['menu_btn'], T.ICO_MENU, self.app.HIT_MENUBTN, p,
+                     active=g.get('menu_open'))
+        self._winbtn(cv, L['theme_btn'],
+                     T.ICO_MOON if g['dark'] else T.ICO_SUN,
+                     self.app.HIT_THEME, p)
+        self._winbtn(cv, L['min'], T.ICO_MIN, self.app.HIT_MIN, p)
+        self._winbtn(cv, L['max'],
+                     T.ICO_RESTORE if g.get('maximized') else T.ICO_MAX,
+                     self.app.HIT_MAX, p)
+        self._winbtn(cv, L['close'], T.ICO_CLOSE, self.app.HIT_CLOSE, p,
+                     danger=True)
+
+    def _winbtn(self, cv, rc, ico, kind, p, danger=False, active=False):
         g = self.app.g
-        # 关闭
-        rc = L['close']
-        hot = g['hover'] == self.app.HIT_CLOSE
+        sc = self.app.sc
+        hot = (g['hover'] == kind) or active
+        rad = sc(T.R_XS)
         if hot:
-            fill_round(hdc, rc, lighten(pal['danger'], 0.0) if not g['dark']
-                       else rgb(0xC4, 0x2B, 0x2B), 0)
-        col = rgb(255, 255, 255) if hot else pal['text_dim']
-        self._draw_x_icon(hdc, rc, col)
-        # 最小化
-        rc = L['min']
-        if g['hover'] == self.app.HIT_MIN:
-            fill_round(hdc, rc, pal['hover'], 0)
-        self._draw_min_icon(hdc, rc, pal['text_dim'])
+            c = p['danger'] if danger else p['panel_3'][0]
+            a = 230 if danger else p['panel_3'][1]
+            cv.blend_round(rc, c, rad, a)
+        col = rgb(255, 255, 255) if (hot and danger) else \
+            (p['fg'] if hot else p['fg_dim'])
+        text(cv.hdc, g['font_cache']['icon_md'], col, rc.left, rc.top,
+             rc.right - rc.left, rc.bottom - rc.top, ico,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
-    def _draw_x_icon(self, hdc, rc, col):
-        s = self.app.sc
-        cx = (rc.left + rc.right) // 2
-        cy = (rc.top + rc.bottom) // 2
-        r = s(5)
-        line(hdc, cx - r, cy - r, cx + r, cy + r, col, max(1, s(1)))
-        line(hdc, cx - r, cy + r, cx + r, cy - r, col, max(1, s(1)))
-
-    def _draw_min_icon(self, hdc, rc, col):
-        s = self.app.sc
-        cx = (rc.left + rc.right) // 2
-        cy = (rc.top + rc.bottom) // 2
-        r = s(5)
-        line(hdc, cx - r, cy, cx + r, cy, col, max(1, s(1)))
-
-    # ---------------------------------------------------- 操作行
-    def _draw_actions(self, hdc, L, pal):
+    # ---------------------------------------------------- 工具栏
+    def _toolbar(self, cv, L, p):
         g = self.app.g
-        sc = self.app.sc
-        sel = self.app.selected_row()
+        F = g['font_cache']
+        rc = L['toolbar']
+        c = p['toolbar']
+        cv.blend_rect(rc, c[0], c[1])
+        self._hline(cv, 0, L['w'], rc.bottom - 1, p['stroke'])
 
-        # 主按钮：置顶/取消
-        rc = L['btn_toggle']
+        sel = self.app.selected_row()
+        is_on = bool(sel and sel[4])
+
+        b = L['btn_toggle']
         hot = g['hover'] == self.app.HIT_TOGGLE
         press = g['press'] == self.app.HIT_TOGGLE
-        is_on = bool(sel and sel[4])
-        acc = pal['accent']
-        if is_on:
-            c_top = lighten(acc, 0.10 if not press else 0.0)
-            c_bot = darken(acc, 0.12 if not press else 0.02)
-        else:
-            c_top = lighten(acc, 0.22) if hot else lighten(acc, 0.12)
-            c_bot = darken(acc, 0.02) if hot else darken(acc, 0.12)
+        c1 = lighten(p['brand'], 0.10 if hot else 0.0)
+        c2 = lighten(p['brand_2'], 0.10 if hot else 0.0)
         if press:
-            c_top = darken(c_top, 0.10)
-            c_bot = darken(c_bot, 0.10)
-        fill_round_grad(hdc, rc, c_top, c_bot, L['btn_r'])
-        label = "取消置顶" if is_on else "置顶窗口"
-        ico = T.ICO_UNPIN if is_on else T.ICO_PIN
-        self._draw_btn_content(hdc, rc, ico, label, pal['on_accent'],
-                               g['font_cache']['body_sb'])
+            c1, c2 = darken(c1, 0.10), darken(c2, 0.10)
+        self._button(cv, b, p, primary=True,
+                     icon=T.ICO_UNPIN if is_on else T.ICO_PIN,
+                     label="取消置顶" if is_on else "置顶窗口", c1=c1, c2=c2)
 
-        # 圆形图标按钮
-        self._draw_icon_btn(hdc, L['btn_refresh'], T.ICO_REFRESH,
-                            self.app.HIT_REFRESH, pal)
-        self._draw_icon_btn(hdc, L['btn_clear'], T.ICO_CLEAR,
-                            self.app.HIT_CLEAR, pal)
+        self._button(cv, L['btn_refresh'], p, icon=T.ICO_REFRESH, label="刷新",
+                     hover=g['hover'] == self.app.HIT_REFRESH)
+        self._button(cv, L['btn_clear'], p, icon=T.ICO_CLEAR, label="取消全部",
+                     hover=g['hover'] == self.app.HIT_CLEAR,
+                     enabled=any(r[4] for r in g['rows']))
+        self._search(cv, L, p)
 
-        # 搜索框
-        self._draw_search(hdc, L['search'], pal)
-
-    def _draw_btn_content(self, hdc, rc, ico, label, fg, font):
+    def _button(self, cv, rc, p, primary=False, hover=False, c1=None, c2=None,
+                icon=None, label="", enabled=True):
+        g = self.app.g
         sc = self.app.sc
-        iw, ih = measure(hdc, font, label)
-        total = sc(18) + sc(6) + iw
+        F = g['font_cache']
+        rad = sc(BTN_R)
+
+        if primary and enabled:
+            grad_round(cv.hdc, rc, c1 or p['brand'], c2 or p['brand_2'], rad)
+            fg = p['on_brand']
+        else:
+            fill = p['panel_2'] if (hover and enabled) else p['panel']
+            edge = p['stroke_2'] if (hover and enabled) else p['stroke']
+            if not enabled:
+                fill = (fill[0], max(8, fill[1] // 2))
+                edge = (edge[0], max(8, edge[1] // 2))
+            cv.panel(rc, rad, fill, edge)
+            fg = p['fg'] if enabled else p['fg_mute']
+
+        iw = sc(15)
+        tw = measure(cv.hdc, F['btn'], label)[0] if label else 0
+        gap = sc(7) if (icon and label) else 0
+        total = (iw if icon else 0) + gap + tw
         x = rc.left + (rc.right - rc.left - total) // 2
-        cy = (rc.top + rc.bottom) // 2
-        text(hdc, self.app.g['font_cache']['icon_sm'], fg,
-             x, rc.top, sc(18), rc.bottom - rc.top, ico,
-             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-        text(hdc, font, fg, x + sc(18) + sc(6), rc.top, iw + sc(4),
-             rc.bottom - rc.top, label)
+        if icon:
+            text(cv.hdc, F['icon'], fg, x, rc.top, iw, rc.bottom - rc.top,
+                 icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+            x += iw + gap
+        if label:
+            text(cv.hdc, F['btn'], fg, x, rc.top, tw + sc(4),
+                 rc.bottom - rc.top, label)
 
-    def _draw_icon_btn(self, hdc, rc, ico, kind, pal):
+    def _search(self, cv, L, p):
         g = self.app.g
         sc = self.app.sc
-        hot = g['hover'] == kind
-        press = g['press'] == kind
-        cx = (rc.left + rc.right) // 2
-        cy = (rc.top + rc.bottom) // 2
-        rad = (rc.right - rc.left) // 2
-        if hot:
-            fill_round(hdc, rc, pal['hover'] if not press else pal['stroke'], rad)
-        stroke_round(hdc, rc, pal['stroke'], rad)
-        col = pal['text'] if hot else pal['text_dim']
-        text(hdc, g['font_cache']['icon'], col,
-             rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, ico,
+        F = g['font_cache']
+        rc = L['search']
+        cv.panel(rc, sc(BTN_R), p['field'], p['stroke'])
+        text(cv.hdc, F['icon_sm'], p['fg_mute'], rc.left + sc(11), rc.top,
+             sc(20), rc.bottom - rc.top, T.ICO_SEARCH,
              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-
-    def _draw_search(self, hdc, rc, pal):
-        g = self.app.g
-        sc = self.app.sc
-        rad = (rc.bottom - rc.top) // 2
-        fill_round(hdc, rc, pal['field'], rad)
-        stroke_round(hdc, rc, pal['stroke'], rad)
-        col = pal['text_faint']
-        text(hdc, g['font_cache']['icon_sm'], col,
-             rc.left + sc(12), rc.top, sc(18), rc.bottom - rc.top, T.ICO_SEARCH,
-             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-        hint = g['filter'] or "搜索窗口…"
-        col = pal['text'] if g['filter'] else pal['text_faint']
-        text(hdc, g['font_cache']['body'], col,
-             rc.left + sc(36), rc.top, rc.right - rc.left - sc(46),
-             rc.bottom - rc.top, hint)
-
-    # ---------------------------------------------------- 设置卡片
-    def _draw_settings(self, hdc, L, pal):
-        g = self.app.g
-        sc = self.app.sc
-        rc = L['set']
-        r = sc(14)
-        # 玻璃卡片：半透明感用「亮底 + 细描边」表达
-        blend_round(hdc, rc, self._glass(pal), r, self._glass_alpha())
-        stroke_round(hdc, rc, self._glass_edge(pal), r)
-
-        # 左侧图标 + 说明
-        ix = rc.left + sc(16)
-        iy = rc.top + sc(15)
-        ellipse_fg = pal['accent_soft']
-        ellipse(hdc, ix + sc(11), iy + sc(11), sc(11), sc(11), ellipse_fg)
-        text(hdc, g['font_cache']['icon'], pal['accent'],
-             ix, iy, sc(22), sc(22), T.ICO_SETTINGS,
-             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-        text(hdc, g['font_cache']['body_sb'], pal['text'],
-             ix + sc(30), rc.top + sc(12), sc(240), sc(18), "设置")
-        text(hdc, g['font_cache']['small'], pal['text_dim'],
-             ix + sc(30), rc.top + sc(30), sc(260), sc(18),
-             "开机自动运行，置顶后自动转入后台")
-
-        self._draw_switch(hdc, L['sw_autotray'], "置顶后转入后台",
-                          g['autotray'], pal, self.app.HIT_AUTOTRAY)
-        self._draw_switch(hdc, L['sw_autostart'], "开机自启",
-                          g['autostart'], pal, self.app.HIT_AUTOSTART)
-
-    def _draw_switch(self, hdc, rc, label, on, pal, kind):
-        g = self.app.g
-        sc = self.app.sc
-        hot = g['hover'] == kind
-        # 标签
-        text(hdc, g['font_cache']['body'],
-             pal['text'] if hot else pal['text_dim'],
-             rc.left, rc.top, rc.right - rc.left - sc(52),
-             rc.bottom - rc.top, label)
-        # 开关轨道（右侧）
-        tw = sc(38)
-        th = sc(21)
-        tr = _rc(rc.right - tw, rc.top + (rc.bottom - rc.top - th) // 2,
-                 rc.right, rc.top + (rc.bottom - rc.top + th) // 2)
-        rad = th // 2
-        track = pal['accent'] if on else (pal['stroke'] if not hot
-                                           else pal['text_faint'])
-        fill_round(hdc, tr, track, rad)
-        # 滑块
-        kr = th // 2 - sc(2)
-        kx = tr.right - kr - sc(2) if on else tr.left + kr + sc(2)
-        ky = (tr.top + tr.bottom) // 2
-        knob = pal['on_accent'] if not g['dark'] else rgb(255, 255, 255)
-        ellipse(hdc, kx, ky, kr, kr, knob)
-
-    def _glass(self, pal, k=1.0):
-        """玻璃卡片底色：在底色与卡片色之间插值，k 越大越"实"。"""
-        if self.app.g['dark']:
-            # 深色：卡片比背景略亮，保持通透
-            return mix(pal['bg'], pal['card'], min(1.0, 0.85 * k))
-        # 浅色：卡片接近纯白
-        return mix(pal['bg'], pal['card'], min(1.0, 0.92 * k))
-
-    def _glass_alpha(self):
-        """玻璃卡片不透明度：留出余量让流光背景透上来。"""
-        return 150 if self.app.g['dark'] else 168
-
-    def _glass_edge(self, pal):
-        """玻璃卡片描边：深色下用微亮的白，浅色下用灰。"""
-        if self.app.g['dark']:
-            return mix(pal['stroke'], rgb(255, 255, 255), 0.10)
-        return pal['stroke']
+        if not g['filter']:
+            e = L['search_edit']
+            text(cv.hdc, F['body'], p['fg_mute'], e.left, rc.top,
+                 e.right - e.left, rc.bottom - rc.top, "搜索窗口…")
 
     # ---------------------------------------------------- 列表
-    def _draw_list(self, hdc, L, pal):
+    def _list(self, cv, L, p):
         g = self.app.g
         sc = self.app.sc
+        F = g['font_cache']
         rc = L['list']
-        r = sc(14)
-        blend_round(hdc, rc, self._glass(pal), r, self._glass_alpha())
-        stroke_round(hdc, rc, self._glass_edge(pal), r)
 
-        # 列表标题行
-        cr = L['count']
+        cv.panel(rc, sc(T.R_LG), p['panel'], p['stroke'])
+
+        head = L['list_head']
+        text(cv.hdc, F['body_sb'], p['fg'], head.left + sc(14), head.top,
+             sc(220), head.bottom - head.top, "窗口列表")
         total = len(g['rows'])
-        pinned = sum(1 for x in g['rows'] if x[4])
-        text(hdc, g['font_cache']['body_sb'], pal['text'],
-             cr.left, cr.top, sc(200), cr.bottom - cr.top, "窗口列表")
+        pinned = sum(1 for r in g['rows'] if r[4])
         right = "%d 个窗口" % total
         if pinned:
-            right = "%d 个 · %d 个已置顶" % (total, pinned)
-        text(hdc, g['font_cache']['small'], pal['text_faint'],
-             cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, right,
+            right += " · %d 个已置顶" % pinned
+        text(cv.hdc, F['status'], p['fg_mute'], head.left, head.top,
+             head.right - head.left - sc(14), head.bottom - head.top, right,
              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-        line(hdc, rc.left + sc(12), cr.bottom, rc.right - sc(12), cr.bottom,
-             pal['stroke_soft'], 1)
+        self._hline(cv, rc.left + sc(1), rc.right - sc(1), head.bottom,
+                    p['row_line'])
 
         inner = L['list_inner']
         if total == 0:
-            self._draw_empty(hdc, inner, pal)
+            self._empty(cv, inner, p)
             return
 
         rh = L['row_h']
-        saved = gdi32.SaveDC(ctypes.c_void_p(hdc))
-        gdi32.IntersectClipRect(ctypes.c_void_p(hdc), inner.left, inner.top,
+        saved = gdi32.SaveDC(ctypes.c_void_p(cv.hdc))
+        gdi32.IntersectClipRect(ctypes.c_void_p(cv.hdc), inner.left, inner.top,
                                 inner.right, inner.bottom)
         first = max(0, g['scroll'] // rh)
         last = min(total, (g['scroll'] + (inner.bottom - inner.top)) // rh + 1)
         for i in range(first, last):
             y = inner.top + i * rh - g['scroll']
-            self._draw_row(hdc, _rc(inner.left, y, inner.right, y + rh),
-                           i, pal)
+            self._row(cv, _rc(inner.left + sc(6), y + sc(2),
+                              inner.right - sc(6), y + rh - sc(2)), i, p)
         if saved:
-            gdi32.RestoreDC(ctypes.c_void_p(hdc), saved)
-        self._draw_scrollbar(hdc, L, pal)
+            gdi32.RestoreDC(ctypes.c_void_p(cv.hdc), saved)
+        self._scrollbar(cv, L, p)
 
-    def _draw_row(self, hdc, rc, idx, pal):
+    def _row(self, cv, rc, idx, p):
         g = self.app.g
         sc = self.app.sc
+        F = g['font_cache']
         hwnd, title, exe, path, top = g['rows'][idx]
         sel = (idx == g['sel'])
         hot = (idx == g['hover_row'])
-        rad = sc(9)
-        pad = sc(8)
-        row_h = rc.bottom - rc.top
+        rad = sc(T.R_SM)
 
         if sel:
-            fill_round(hdc, rc, pal['active'], rad)
-            stroke_round(hdc, rc, mix(pal['accent'], pal['stroke'], 0.45), rad)
+            c = p['brand_soft']
+            cv.blend_round(rc, c[0], rad, c[1])
+            bar = _rc(rc.left + sc(1), rc.top + sc(8), rc.left + sc(3),
+                      rc.bottom - sc(8))
+            fill_round(cv.hdc, bar, p['sel_line'], sc(1))
         elif hot:
-            fill_round(hdc, rc, pal['hover'], rad)
+            c = p['panel_3']
+            cv.blend_round(rc, c[0], rad, c[1])
 
-        # 左侧：已置顶的窗口加一条强调色竖条
-        if top:
-            bar = _rc(rc.left + sc(2), rc.top + sc(10), rc.left + sc(4),
-                      rc.bottom - sc(10))
-            fill_round(hdc, bar, pal['accent'], sc(1))
-
-        # 程序图标
-        isz = sc(20)
-        ix = rc.left + pad + sc(6)
-        iy = rc.top + (row_h - isz) // 2
+        cy = (rc.top + rc.bottom) // 2
+        isz = sc(ICON_SZ)
+        ix = rc.left + sc(10)
+        iy = cy - isz // 2
         iidx = g['icon_cache'].get(path, -1)
         if iidx >= 0 and g['himl']:
-            comctl32.ImageList_Draw(g['himl'], iidx, ctypes.c_void_p(hdc),
-                                    ix, iy, 0)
+            comctl32 = ctypes.WinDLL("comctl32")
+            comctl32.ImageList_Draw(g['himl'], iidx,
+                                    ctypes.c_void_p(cv.hdc), ix, iy, 0)
         else:
-            ellipse(hdc, ix + isz // 2, iy + isz // 2, sc(9), sc(9),
-                    mix(pal['text_faint'], pal['stroke'], 0.5))
+            ellipse(cv.hdc, ix + isz // 2, cy, isz // 2 - sc(2),
+                    isz // 2 - sc(2), mix(p['brand'], p['fg_mute'], 0.5))
 
         tx = ix + isz + sc(12)
-        # 右侧为置顶标记留位
-        right_pad = sc(34) if top else sc(10)
+        rp = sc(30) if top else sc(6)
+        text(cv.hdc, F['row_sb'] if (sel or top) else F['row'],
+             p['fg'] if not sel else rgb(255, 255, 255),
+             tx, rc.top + sc(4), rc.right - tx - rp, sc(19), title,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+             DT_NOPREFIX)
+        text(cv.hdc, F['row_sub'], p['fg_mute'], tx, rc.top + sc(23),
+             rc.right - tx - rp, sc(15), exe,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+             DT_NOPREFIX)
 
-        # 标题：占上半部分
-        tfont = g['font_cache']['body_sb'] if top else g['font_cache']['body']
-        text(hdc, tfont, pal['text'],
-             tx, rc.top + sc(5), rc.right - tx - right_pad, sc(20), title,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
-
-        # 进程名：占下半部分
-        text(hdc, g['font_cache']['tiny'], pal['text_faint'],
-             tx, rc.top + sc(23), rc.right - tx - right_pad, sc(16), exe,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
-
-        # 右侧：置顶标记
         if top:
-            mx = rc.right - pad - sc(16)
-            my = (rc.top + rc.bottom) // 2
-            ellipse(hdc, mx, my, sc(10), sc(10), pal['accent_soft'])
-            text(hdc, g['font_cache']['icon_sm'], pal['accent'],
-                 mx - sc(10), my - sc(10), sc(20), sc(20), T.ICO_PIN,
+            mx = rc.right - sc(17)
+            text(cv.hdc, F['icon_sm'], p['brand_2'], mx - sc(9), cy - sc(9),
+                 sc(18), sc(18), T.ICO_PIN,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
-    def _draw_empty(self, hdc, inner, pal):
+    def _empty(self, cv, inner, p):
         g = self.app.g
         sc = self.app.sc
         cx = (inner.left + inner.right) // 2
-        cy = (inner.top + inner.bottom) // 2
-        ellipse(hdc, cx, cy - sc(22), sc(22), sc(22), pal['stroke_soft'])
-        text(hdc, g['font_cache']['icon_xl'], pal['text_faint'],
-             cx - sc(22), cy - sc(44), sc(44), sc(44), T.ICO_SEARCH,
+        cy = (inner.top + inner.bottom) // 2 - sc(10)
+        ellipse(cv.hdc, cx, cy, sc(26), sc(26), p['panel_3'][0])
+        text(cv.hdc, g['font_cache']['icon_lg'], p['fg_mute'],
+             cx - sc(24), cy - sc(24), sc(48), sc(48), T.ICO_SEARCH,
              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
         msg = "没有匹配的窗口" if g['filter'] else "暂无可置顶的窗口"
-        text(hdc, g['font_cache']['body'], pal['text_dim'],
-             cx - sc(140), cy + sc(6), sc(280), sc(20), msg,
+        text(cv.hdc, g['font_cache']['body'], p['fg_dim'],
+             cx - sc(160), cy + sc(36), sc(320), sc(20), msg,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+        text(cv.hdc, g['font_cache']['status'], p['fg_mute'],
+             cx - sc(200), cy + sc(56), sc(400), sc(18), "双击列表项即可置顶 / 取消",
              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
-    def _draw_scrollbar(self, hdc, L, pal):
+    def _scrollbar(self, cv, L, p):
         g = self.app.g
         sc = self.app.sc
         if g['scroll_max'] <= 0:
             return
         inner = L['list_inner']
-        track_h = inner.bottom - inner.top
-        ratio = (inner.bottom - inner.top) / float(
-            len(g['rows']) * L['row_h'])
-        thumb_h = max(sc(28), int(track_h * ratio))
-        max_scroll = g['scroll_max']
-        frac = (g['scroll'] / float(max_scroll)) if max_scroll else 0
-        ty = inner.top + int((track_h - thumb_h) * frac)
-        tr = _rc(inner.right - sc(9), ty, inner.right - sc(4), ty + thumb_h)
-        fill_round(hdc, tr, pal['text_faint'], (tr.right - tr.left) // 2)
+        track = inner.bottom - inner.top
+        ratio = track / float(max(1, len(g['rows']) * L['row_h']))
+        th = max(sc(30), int(track * ratio))
+        frac = g['scroll'] / float(g['scroll_max'])
+        ty = inner.top + int((track - th) * frac)
+        tr = _rc(inner.right - sc(10), ty, inner.right - sc(5), ty + th)
+        # fg_mute 是实色（非透明元组），滚动条单独给个半透明
+        cv.blend_round(tr, p['fg_mute'], (tr.right - tr.left) // 2, 140)
 
-    # ---------------------------------------------------- 底部状态
-    def _draw_footer(self, hdc, L, pal):
+    # ---------------------------------------------------- 状态栏
+    def _statusbar(self, cv, L, p):
+        g = self.app.g
+        F = g['font_cache']
+        rc = L['statusbar']
+        c = p['statusbar']
+        cv.blend_rect(rc, c[0], c[1])
+        self._hline(cv, 0, L['w'], rc.top, p['stroke'])
+
+        hint = g['hint'] or "双击列表项或按 Ctrl+Alt+T 切换置顶"
+        sl = L['status_left']
+        text(cv.hdc, F['status'], p['fg_mute'], sl.left, sl.top,
+             sl.right - sl.left, sl.bottom - sl.top, hint,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+             DT_NOPREFIX)
+        sr = L['status_right']
+        text(cv.hdc, F['status_sb'], p['fg_dim'], sr.left, sr.top,
+             sr.right - sr.left, sr.bottom - sr.top,
+             "%d 个窗口" % len(g['rows']),
+             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+
+    # ---------------------------------------------------- 菜单（浮层）
+    def _menu(self, cv, L, p):
         g = self.app.g
         sc = self.app.sc
-        rc = L['foot']
-        hint = g['hint'] or "双击列表项或按 Ctrl+Alt+T 切换置顶"
-        text(hdc, g['font_cache']['small'], pal['text_faint'],
-             rc.left, rc.top, rc.right - rc.left - sc(120),
-             rc.bottom - rc.top, hint,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
-        text(hdc, g['font_cache']['tiny'], pal['text_faint'],
-             rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-             "v2.0", DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+        F = g['font_cache']
+        rc = L.get('menu')
+        if not rc:
+            return
 
+        cv.panel(rc, sc(T.R_MD), p['menu'], p['stroke_2'])
 
-def time_now():
-    return time.time()
+        items = self.menu_items()
+        for idx, irc in self.menu_hits:
+            it = items[idx]
+            hot = (g['hover'] == self.app.HIT_MENU and
+                   g.get('hover_menu') == idx)
+            if hot:
+                c = p['brand_soft']
+                cv.blend_round(irc, c[0], sc(T.R_SM), c[1])
+            fg = p['fg'] if hot else p['fg_dim']
+            icon_col = p['brand_2'] if hot else p['fg_mute']
 
+            ix = irc.left + sc(10)
+            text(cv.hdc, F['icon_sm'], icon_col, ix, irc.top, sc(16),
+                 irc.bottom - irc.top, it['icon'],
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
-# 让 SaveDC / IntersectClipRect / RestoreDC 有原型
-gdi32.SaveDC.argtypes = [ctypes.c_void_p]
-gdi32.SaveDC.restype = ctypes.c_int
-gdi32.RestoreDC.argtypes = [ctypes.c_void_p, ctypes.c_int]
-gdi32.RestoreDC.restype = ctypes.c_int
-gdi32.IntersectClipRect.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4
-gdi32.IntersectClipRect.restype = ctypes.c_int
+            rw = 0
+            if 'switch' in it:
+                rw = sc(34 + 12)
+            elif it.get('note'):
+                rw = measure(cv.hdc, F['status'], it['note'])[0] + sc(12)
+            text(cv.hdc, F['menu'], fg, ix + sc(26), irc.top,
+                 irc.right - ix - sc(26) - rw, irc.bottom - irc.top,
+                 it['text'],
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                 DT_NOPREFIX)
+
+            if 'switch' in it:
+                self._switch(cv, irc, bool(it['switch']), p)
+            elif it.get('note'):
+                text(cv.hdc, F['status'], p['fg_mute'], irc.left, irc.top,
+                     irc.right - sc(10), irc.bottom - irc.top, it['note'],
+                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+
+        cy = rc.top + sc(MENU_PAD)
+        for it in items:
+            ih = sc(MENU_SEP_H) if it.get('sep') else sc(MENU_ITEM_H)
+            if it.get('sep'):
+                self._hline(cv, rc.left + sc(8), rc.right - sc(8),
+                            cy + ih // 2, p['stroke'])
+            cy += ih
+
+    def _switch(self, cv, item_rc, on, p):
+        """菜单项右侧开关（对齐 CSS .switch：34x19，启用态用主题渐变）。"""
+        sc = self.app.sc
+        tw, th = sc(34), sc(19)
+        top = item_rc.top + (item_rc.bottom - item_rc.top - th) // 2
+        tr = _rc(item_rc.right - sc(10) - tw, top, item_rc.right - sc(10),
+                 top + th)
+        rad = th // 2
+        if on:
+            grad_round(cv.hdc, tr, p['brand'], p['brand_2'], rad)
+        else:
+            c = p['panel_3']
+            cv.blend_round(tr, c[0], rad, max(46, c[1]))
+        kr = rad - sc(2)
+        kx = tr.right - rad if on else tr.left + rad
+        ky = (tr.top + tr.bottom) // 2
+        ellipse(cv.hdc, kx, ky, kr, kr, rgb(255, 255, 255))

@@ -25,7 +25,7 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pillow aggdraw
+          pip install pyinstaller
 
       # 下载 UPX 并加入 PATH，供 PyInstaller 压缩体积（GitHub 运行器默认不带 UPX）
       # 注意：Windows runner 的 bash 里 tar 是 GNU tar，不能解 .zip，故用 PowerShell 的 Expand-Archive
@@ -39,13 +39,18 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $upxDir -Encoding utf8
           Write-Host "UPX dir: $upxDir"
 
+      # 由 appicon.py 纯代码生成图标，保证 exe 图标 / 任务栏 / 托盘与界面 logo 一致。
+      # 同时校验图标可在无第三方库的环境下生成（本程序已完全去除 Pillow 依赖）。
+      - name: Generate icons
+        run: python gen_icon.py
+
       # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
       - name: Build exes
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop --icon icon.ico --add-data "icon.png;." --hidden-import PIL --hidden-import aggdraw --exclude-module PIL._avif --exclude-module PIL._webp --exclude-module PIL._imagingcms --exclude-module PIL._imagingft --exclude-module PIL._imagingtk ontop.py
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop --icon icon.ico ontop.py
           mkdir release
           copy dist\AlwaysOnTop.exe release\AlwaysOnTop.exe
-          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico --add-data "icon.png;." --hidden-import PIL --hidden-import aggdraw --exclude-module PIL._avif --exclude-module PIL._webp --exclude-module PIL._imagingcms --exclude-module PIL._imagingft --exclude-module PIL._imagingtk ontop.py
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico ontop.py
           copy dist\AlwaysOnTop_v2.exe release\AlwaysOnTop_v2.exe
 
       - name: Publish release
