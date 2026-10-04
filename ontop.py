@@ -1246,6 +1246,14 @@ def default_pos(w, h):
 
 
 def main():
+    # 控制台编码可能是 cp1252（Windows CI / 部分环境），此时任何中文输出都会抛
+    # UnicodeEncodeError 把进程打挂。先把它调成 UTF-8 容错模式。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     try:
         user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
