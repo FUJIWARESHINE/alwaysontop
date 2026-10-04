@@ -1,5 +1,6 @@
 # PyInstaller 临时产物
 build/
+dist/
 __pycache__/
 *.pyc
 *.spec
