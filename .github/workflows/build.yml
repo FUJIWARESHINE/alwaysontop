@@ -7,10 +7,18 @@ name: Build & Release
 # 页面上的日期永远是最初那一天，看起来像没更新（资源其实已经换了）。
 # 改成每次构建都递增一个版本号并新建 release，仓库首页的 Releases 就能看到
 # 当天的新版本，下载链接也仍然稳定（资产名固定不变）。
+#
+# 另外：纯文档 / 记忆 / 本工作流自身的改动不必发新版本，用 paths-ignore 跳过，
+# 免得每次改 README 就多出一个 release。注意「路径过滤对 tag 推送不生效」，
+# 所以手动推 v* 标签一定会构建；改完工作流想验证，用 workflow_dispatch 手动跑。
 on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore:
+      - '.workbuddy/**'
+      - '**.md'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 # 发布 release / 打 tag 需要写权限
