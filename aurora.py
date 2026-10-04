@@ -188,6 +188,8 @@ class Canvas:
         self.hbm = None
         self._bits = ctypes.c_void_p()
         self._lut_cache = {}
+        self._cov_cache = {}
+        self._ring_cache = {}
 
     def ensure(self, w, h):
         w, h = max(1, int(w)), max(1, int(h))
@@ -268,6 +270,148 @@ class Canvas:
         seg[2::4] = bytes(seg[2::4]).translate(lr)
         return seg
 
+    def _corner_cov(self, r_c):
+        """半径 r_c 的圆角覆盖率表（按半径缓存）。
+
+        四个角是对称的：以「距该角的两条外边各 i / j 像素」为局部坐标，
+        像素中心 (i+0.5, j+0.5) 到圆心 (r_c, r_c) 的距离就决定了覆盖率，
+        与是哪个角无关，只需在半径首次出现时算一次 sqrt。
+        返回 [(i, j, cov), ...]，只含 cov < 1 的像素（=1 的保留 LUT 结果）。
+        """
+        v = self._cov_cache.get(r_c)
+        if v is not None:
+            return v
+        items = []
+        for j in range(r_c):
+            dy = j + 0.5 - r_c
+            for i in range(r_c):
+                dx = i + 0.5 - r_c
+                cov = r_c + 0.5 - math.sqrt(dx * dx + dy * dy)
+                if cov < 1.0:
+                    items.append((i, j, cov if cov > 0.0 else 0.0))
+        self._cov_cache[r_c] = items
+        return items
+
+    def _apply_rect(self, blk, n, s_ofs, e_ofs, lb, lg, lr):
+        """把 LUT 叠加到 blk 的第 [s_ofs, e_ofs) 列（整行切片坐标系）。
+
+        blk 是「从 x=0 起的整行」缓冲区，所以 s_ofs / e_ofs 是**字节**偏移。
+        逐行切片时每行只有几十字节，3090 行的面板就会产生上千次
+        slice+translate（Python 层开销占主导）。这里按宽度分档：
+
+        - 整行宽：一次 translate 搞定
+        - 单列：用扩展切片（步长=stride）一次处理整列
+        - 较宽：先整行 translate，再把左右边距按行还原（只做拷贝，不做 translate）
+        - 较窄：回到逐行（这时拷贝量小，逐行更划算）
+        """
+        if e_ofs <= s_ofs or n <= 0:
+            return
+        stride = self.stride
+        if s_ofs == 0 and e_ofs >= stride:
+            self._apply(blk, lb, lg, lr)
+            return
+        if e_ofs - s_ofs == 4:
+            # 单列：每行只有 4 字节，逐行毫无意义
+            blk[s_ofs::stride] = bytes(blk[s_ofs::stride]).translate(lb)
+            blk[s_ofs + 1::stride] = bytes(blk[s_ofs + 1::stride]).translate(lg)
+            blk[s_ofs + 2::stride] = bytes(blk[s_ofs + 2::stride]).translate(lr)
+            return
+        if (e_ofs - s_ofs) * 4 >= stride:
+            # 较宽：整行一次 LUT，再还原左右边距
+            orig = bytes(blk)
+            self._apply(blk, lb, lg, lr)
+            for row in range(0, n, stride):
+                if s_ofs:
+                    blk[row:row + s_ofs] = orig[row:row + s_ofs]
+                if e_ofs < stride:
+                    blk[row + e_ofs:row + stride] = orig[row + e_ofs:row + stride]
+            return
+        for row in range(0, n, stride):
+            blk[row + s_ofs:row + e_ofs] = self._apply(
+                blk[row + s_ofs:row + e_ofs], lb, lg, lr)
+
+    def _ring_cov(self, r_c):
+        """半径 r_c 的 1px 圆环覆盖率表（外圆 r_c 减内圆 r_c-1）。
+
+        panel 的内填矩形是「外框内缩 1px、半径减 1」，它的圆角圆心与外框
+        的圆心重合，所以四角描边正好是同心圆之间的环，可直接查表。
+        """
+        v = self._ring_cache.get(r_c)
+        if v is not None:
+            return v
+        items = []
+        rin = r_c - 1
+        for j in range(r_c):
+            dy = j + 0.5 - r_c
+            for i in range(r_c):
+                dx = i + 0.5 - r_c
+                d = math.sqrt(dx * dx + dy * dy)
+                co = r_c + 0.5 - d
+                ci = (rin + 0.5 - d) if rin > 0 else 0.0
+                if co > 1.0:
+                    co = 1.0
+                elif co < 0.0:
+                    co = 0.0
+                if ci > 1.0:
+                    ci = 1.0
+                elif ci < 0.0:
+                    ci = 0.0
+                cov = co - ci
+                if cov > 0.0:
+                    items.append((i, j, cov))
+        self._ring_cache[r_c] = items
+        return items
+
+    def blend_round_ring(self, rc, radius, color, alpha):
+        """只画 1px 圆角边框：四条细带 + 四个 90° 圆环。
+
+        面积是「周长」量级，远小于整块铺一遍描边色。
+        """
+        x0, y0 = max(0, rc.left), max(0, rc.top)
+        x1, y1 = min(self.w, rc.right), min(self.h, rc.bottom)
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0 or alpha <= 0:
+            return
+        c = color_of(color)
+        r_c = int(max(0, min(radius, w // 2, h // 2)))
+        if r_c <= 0:
+            self.blend_rect(RECT(x0, y0, x1, y0 + 1), c, alpha)
+            self.blend_rect(RECT(x0, y1 - 1, x1, y1), c, alpha)
+            if h > 2:
+                self.blend_rect(RECT(x0, y0 + 1, x0 + 1, y1 - 1), c, alpha)
+                self.blend_rect(RECT(x1 - 1, y0 + 1, x1, y1 - 1), c, alpha)
+            return
+        self.blend_rect(RECT(x0 + r_c, y0, x1 - r_c, y0 + 1), c, alpha)
+        self.blend_rect(RECT(x0 + r_c, y1 - 1, x1 - r_c, y1), c, alpha)
+        self.blend_rect(RECT(x0, y0 + r_c, x0 + 1, y1 - r_c), c, alpha)
+        self.blend_rect(RECT(x1 - 1, y0 + r_c, x1, y1 - r_c), c, alpha)
+
+        covs = self._ring_cov(r_c)
+        if not covs:
+            return
+        cr_, cg_, cb_ = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
+        a = int(alpha) / 255.0
+        stride = self.stride
+        rmax = r_c - 1
+        for top in (True, False):
+            for left in (True, False):
+                bx = x0 if left else (x1 - r_c)
+                by = y0 if top else (y1 - r_c)
+                off = by * stride + bx * 4
+                blk = self._read(off, r_c * stride)
+                for i, j, cov in covs:
+                    ky = j if top else (rmax - j)
+                    kx = i if left else (rmax - i)
+                    kk = a * cov
+                    inv = 1.0 - kk
+                    q = ky * stride + kx * 4
+                    blk[q] = min(255, int(blk[q] * inv + cb_ * kk + 0.5))
+                    blk[q + 1] = min(255, int(blk[q + 1] * inv
+                                            + cg_ * kk + 0.5))
+                    blk[q + 2] = min(255, int(blk[q + 2] * inv
+                                            + cr_ * kk + 0.5))
+                self._write(off, blk)
+
     # ---------------------------------------------------------- 半透明填充
     def blend_rect(self, rc, color, alpha):
         """矩形半透明叠加（按行连续，整块处理，最快）。"""
@@ -280,21 +424,20 @@ class Canvas:
             fill_rect(self.hdc, RECT(x0, y0, x1, y1), c)
             return
         lb, lg, lr = self._luts(c, alpha)
-        full = (x0 == 0 and x1 == self.w)
         off = y0 * self.stride
         n = (y1 - y0) * self.stride
         blk = self._read(off, n)
-        if full:
-            self._apply(blk, lb, lg, lr)
-        else:
-            s, e = x0 * 4, x1 * 4
-            for row in range(0, n, self.stride):
-                blk[row + s:row + e] = self._apply(blk[row + s:row + e],
-                                                   lb, lg, lr)
+        self._apply_rect(blk, n, x0 * 4, x1 * 4, lb, lg, lr)
         self._write(off, blk)
 
     def blend_round(self, rc, color, radius, alpha):
-        """半透明圆角矩形：矩形按 LUT 叠加，四角按圆覆盖率抗锯齿。"""
+        """半透明圆角矩形：主体走逐行 LUT（快），四角按圆覆盖率混合。
+
+        坐标系必须统一到「像素中心 = 局部坐标 + 0.5」：圆心在 (r_c, r_c)、
+        (w - r_c, h - r_c)。之前圆心写成了 r_c - 0.5，导致圆角被切在
+        离角 r_c~r_c+5px 的位置——表现为顶边中间出现缺口，而四个角本身
+        仍是直角（就是"右边又有圆角又有直边"的来源）。
+        """
         x0, y0 = max(0, rc.left), max(0, rc.top)
         x1, y1 = min(self.w, rc.right), min(self.h, rc.bottom)
         w, h = x1 - x0, y1 - y0
@@ -311,68 +454,92 @@ class Canvas:
         n = h * self.stride
         blk = self._read(off, n)
 
-        # 先把四角**原始**像素留存，供抗锯齿合成使用
+        # 先留存四角**原始**像素：角部要按覆盖率重新混合；
+        # 若在已叠加的结果上再叠一次，半透明圆角会明显偏深。
+        #
+        # 关键：blk 是「从 x=0 起的整行」切片，不是从 x0 起。
+        # 因此这里的列号必须用**绝对列号**（x0 / x1-r_c），
+        # 用相对列号会把圆角切到矩形中间去。
         corners = []
-        for top in (True, False):
-            for left in (True, False):
-                base_row = 0 if top else h - r_c
-                base_col = 0 if left else w - r_c
+        for by in (0, h - r_c):                 # 行：相对 blk（blk 首行即 y0）
+            for bx in (x0, x1 - r_c):           # 列：绝对
                 rows = []
                 for yy in range(r_c):
-                    st = (base_row + yy) * self.stride + base_col * 4
+                    st = (by + yy) * self.stride + bx * 4
                     rows.append(blk[st:st + r_c * 4])
-                corners.append((base_row, base_col, rows))
+                corners.append((by, bx, rows))
 
-        # 矩形部分：逐行 LUT 叠加
-        s, e = x0 * 4, x1 * 4
-        for row in range(0, n, self.stride):
-            blk[row + s:row + e] = self._apply(blk[row + s:row + e],
-                                               lb, lg, lr)
+        # 主体：按宽度分档做 LUT 叠加（见 _apply_rect）
+        self._apply_rect(blk, n, x0 * 4, x1 * 4, lb, lg, lr)
 
-        # 四角：按覆盖率从「原始像素」精确混合，避免二次叠加
+        # 四角：按覆盖率（查缓存的表）从原始像素精确混合。
+        # covs 的 (i, j) 是「距该角两条外边」的距离，四个角共用一张表，
+        # 具体像素按 left/top 做镜像。
         cr_, cg_, cb_ = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
         a = int(alpha) / 255.0
-        cen = r_c - 0.5
+        covs = self._corner_cov(r_c)
+        ci = 0
+        stride = self.stride
         for top in (True, False):
             for left in (True, False):
-                ci = 0 if top else 1
-                cj = 0 if left else 1
-                base_row, base_col, rows = corners[ci * 2 + cj]
-                for yy in range(r_c):
-                    ly = yy if top else (r_c - 1 - yy)
-                    dy = ly + 0.5 - cen
-                    rowbase = (base_row + yy) * self.stride
-                    src_row = rows[yy]
-                    for xx in range(r_c):
-                        lx = xx if left else (r_c - 1 - xx)
-                        dx = lx + 0.5 - cen
-                        cov = r_c - math.sqrt(dx * dx + dy * dy)
-                        if cov >= 1.0:
-                            continue
-                        if cov < 0.0:
-                            cov = 0.0
-                        k = a * cov
-                        inv = 1.0 - k
-                        i = rowbase + (base_col + xx) * 4
-                        ob, og, orr = src_row[xx * 4], src_row[xx * 4 + 1], src_row[xx * 4 + 2]
-                        blk[i] = min(255, int(ob * inv + cb_ * k + 0.5))
-                        blk[i + 1] = min(255, int(og * inv + cg_ * k + 0.5))
-                        blk[i + 2] = min(255, int(orr * inv + cr_ * k + 0.5))
+                by, bx, rows = corners[ci]
+                ci += 1
+                rmax = r_c - 1
+                for i, j, cov in covs:
+                    ky = j if top else (rmax - j)
+                    kx = i if left else (rmax - i)
+                    src_row = rows[ky]
+                    t = kx * 4
+                    kk = a * cov
+                    inv = 1.0 - kk
+                    q = (by + ky) * stride + (bx + kx) * 4
+                    blk[q] = min(255, int(src_row[t] * inv + cb_ * kk + 0.5))
+                    blk[q + 1] = min(255, int(src_row[t + 1] * inv
+                                              + cg_ * kk + 0.5))
+                    blk[q + 2] = min(255, int(src_row[t + 2] * inv
+                                              + cr_ * kk + 0.5))
         self._write(off, blk)
 
     def panel(self, rc, radius, fill, stroke=None):
-        """玻璃面板：整块铺描边色，再内缩 1px 铺填充色 → 1px 描边。
-        绕开"GDI 画笔不支持透明度"，视觉等同 CSS `border + background`。"""
-        if stroke is not None:
-            self.blend_round(rc, color_of(stroke), radius, alpha_of(stroke))
-            inner = RECT(rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1)
-            self.blend_round(inner, color_of(fill), max(0, radius - 1),
-                             alpha_of(fill))
-        else:
+        """玻璃面板：内填 + 1px 描边。
+
+        朴素做法是「整块铺一遍描边色，再内缩 1px 铺一遍填充色」，那要
+        处理两倍面积（892x506 的列表卡片约 9.5ms）。这里把两次叠加
+        合并为一次：内填用「先叠描边、再叠填充」的等效颜色/透明度
+        (C, A) 一次画完，描边只在 1px 边框上补。面积从 2·w·h 降到
+        w·h + 周长，视觉等价。
+
+        等效叠加：先叠 (c1, a1) 再叠 (c2, a2)，等价于
+            A = 1 - (1-a1)(1-a2)
+            C·A = c1·a1·(1-a2) + c2·a2
+        """
+        if stroke is None:
             self.blend_round(rc, color_of(fill), radius, alpha_of(fill))
+            return
+
+        a1 = alpha_of(stroke) / 255.0
+        a2 = alpha_of(fill) / 255.0
+        A = 1.0 - (1.0 - a1) * (1.0 - a2)
+        c1 = color_of(stroke)
+        c2 = color_of(fill)
+        inner = RECT(rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1)
+        r_in = max(0, radius - 1)
+
+        if A * 255.0 >= 1.0:
+            def eq(sh):
+                v = (((c1 >> sh) & 0xFF) * a1 * (1.0 - a2)
+                     + ((c2 >> sh) & 0xFF) * a2) / A
+                return int(min(255.0, max(0.0, v + 0.5)))
+            C = eq(0) | (eq(8) << 8) | (eq(16) << 16)
+            Aa = int(min(255.0, max(0.0, A * 255.0 + 0.5)))
+            self.blend_round(inner, C, r_in, Aa)
+
+        self.blend_round_ring(rc, radius, c1, alpha_of(stroke))
+
 
     # ---------------------------------------------------------- 输出
     def blit_to(self, dst_hdc, x=0, y=0):
+        """把整块画布一次性拷到目标 DC（无中间态，不闪烁）。"""
         gdi32.BitBlt(ctypes.c_void_p(dst_hdc), x, y, self.w, self.h,
                      ctypes.c_void_p(self.hdc), 0, 0, SRCCOPY)
 

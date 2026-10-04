@@ -1,0 +1,43 @@
+fix: 修掉列表圆角错位与一个会随机崩溃的堆越界；置顶改为醒目徽章
+
+一、圆角「又有圆角又有直边」的根因（aurora.Canvas.blend_round）
+blk 是「从 x=0 起的整行」切片，不是从 x0 起，而四角裁剪时列号用了
+相对列号（0 / w-r_c），于是圆角被切到矩形中间：顶边中间出现缺口、
+四个角本身反而还是直角。改为绝对列号（bx = x0 / x1-r_c，
+圆心 ccx = x0+r_c / x1-r_c），覆盖率按「像素中心 = 局部坐标 + 0.5」
+计算；覆盖率表按半径缓存（四角对称，共用一张表）。
+
+二、★ 致命 bug：PAINTSTRUCT 缓冲区太小导致随机崩溃（既有 bug）
+on_paint 里用 `create_string_buffer(64)` 接 BeginPaint 的输出，
+但 x64 下 PAINTSTRUCT 是 72 字节（hdc 8 + fErase 4 + 对齐 4 + rcPaint 16
++ fRestore 4 + fIncUpdate 4 + rgbReserved 32）。BeginPaint 每次多写
+8 字节，踩坏相邻 Python 堆块 → 跑十几秒后在完全无关的地方随机崩溃
+（faulthandler 报的位置会漂移：_toolbar 的 genexpr / _row 的 DrawTextW）。
+用 PYTHONMALLOC=debug 一次抓到 bad trailing pad byte，块内容 0e 05 01 65
+正是 PAINTSTRUCT 的 hdc 字段，4/4 稳定复现。
+现在声明真正的 PAINTSTRUCT（sizeof == 72 带断言），
+BeginPaint/EndPaint 原型改成 POINTER(PAINTSTRUCT)，用 byref 传结构体。
+复检：调试分配器下 4/4 通过；--shot 6/6 通过；正常消息循环 25 秒
+539 帧、调试分配器下 15 秒 319 帧均无崩溃。
+
+三、置顶标识
+原来只在行右侧画一个 13px 图钉字形，太细太淡几乎看不见。改为
+「图钉 + 置顶」胶囊徽章（品牌色淡底 + 1px 品牌色描边，右对齐），
+标题/进程名给它让出宽度。真实窗口端到端验证：set_topmost(True) →
+is_topmost 为真 → 行标记为真 → 徽章区域采到品牌色像素。
+
+四、性能（视觉等价，逐像素校验过）
+- panel() 原本「整块铺描边色 + 内缩 1px 铺填充色」= 两倍面积；
+  合并为一次等效叠加（A = 1-(1-a1)(1-a2)，C·A = c1·a1·(1-a2)+c2·a2），
+  描边改用新的 blend_round_ring() 只画 1px 圆环。
+  两主题 × 3 种半径下与旧实现最大通道差 1~4；892x506 面板 9.53→7.64ms。
+- _apply_rect() 按宽度分档：整行宽一次 translate；单列用扩展切片
+  （blk[s::stride]，此前 660 行的 1px 边框要走 660 次逐行切片）；
+  较宽则整行 translate 后还原左右边距；较窄才逐行。
+- 整窗绘制 33.5ms → 27.2ms/帧。
+- ui.py 里每行都 ctypes.WinDLL("comctl32") 重新绑定且无 argtypes
+  （64 位 HIMAGELIST 会被截断）→ 改为模块级带完整原型的绑定。
+
+五、其它
+- --shot 退出路径改为 os._exit(0)，跳过解释器收尾（避免收尾期崩溃）。
+- 删除误提交进仓库的 ontop_v1_backup.py。

@@ -12,6 +12,7 @@
 仅搜索框用真实 EDIT 子控件以支持输入法。
 """
 import ctypes
+import ctypes.wintypes as wt
 import math
 import time
 
@@ -21,6 +22,16 @@ from aurora import (Aurora, Canvas, RECT, rgb, mix, lighten, darken, fill_rect,
                     user32, gdi32,
                     DT_LEFT, DT_CENTER, DT_RIGHT, DT_VCENTER, DT_SINGLELINE,
                     DT_END_ELLIPSIS, DT_NOPREFIX)
+
+# 图像列表：必须声明完整原型。
+# 之前这里每行都 `ctypes.WinDLL("comctl32")` 重新绑定且不带 argtypes，
+# 于是 64 位 HIMAGELIST 被 ctypes 当成 c_int 截断成 32 位；句柄一失效，
+# ImageList_Draw 就会写坏内存，表现为随后在完全无关的调用（如 DrawTextW）
+# 里随机崩溃。这里用模块级绑定 + 完整原型，一次搞定。
+_comctl32 = ctypes.WinDLL("comctl32")
+_comctl32.ImageList_Draw.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                     ctypes.c_int, ctypes.c_int, wt.UINT]
+_comctl32.ImageList_Draw.restype = wt.BOOL
 
 # 布局常量（96 DPI 下的 CSS px）
 TITLEBAR_H = 46
@@ -33,6 +44,8 @@ BTN_H = 34
 BTN_R = 11
 ROW_H = 46
 ICON_SZ = 20
+BADGE_W = 68          # 置顶徽章宽
+BADGE_H = 22          # 置顶徽章高
 MENU_W = 220
 MENU_ITEM_H = 30
 MENU_SEP_H = 10
@@ -445,15 +458,15 @@ class UI:
         iy = cy - isz // 2
         iidx = g['icon_cache'].get(path, -1)
         if iidx >= 0 and g['himl']:
-            comctl32 = ctypes.WinDLL("comctl32")
-            comctl32.ImageList_Draw(g['himl'], iidx,
-                                    ctypes.c_void_p(cv.hdc), ix, iy, 0)
+            _comctl32.ImageList_Draw(g['himl'], iidx,
+                                     ctypes.c_void_p(cv.hdc), ix, iy, 0)
         else:
             ellipse(cv.hdc, ix + isz // 2, cy, isz // 2 - sc(2),
                     isz // 2 - sc(2), mix(p['brand'], p['fg_mute'], 0.5))
 
         tx = ix + isz + sc(12)
-        rp = sc(30) if top else sc(6)
+        # 已置顶的行右侧要放「图钉 + 置顶」徽章，标题/进程名给它让出宽度
+        rp = sc(BADGE_W + 18) if top else sc(6)
         text(cv.hdc, F['row_sb'] if (sel or top) else F['row'],
              p['fg'] if not sel else rgb(255, 255, 255),
              tx, rc.top + sc(4), rc.right - tx - rp, sc(19), title,
@@ -465,10 +478,22 @@ class UI:
              DT_NOPREFIX)
 
         if top:
-            mx = rc.right - sc(17)
-            text(cv.hdc, F['icon_sm'], p['brand_2'], mx - sc(9), cy - sc(9),
-                 sc(18), sc(18), T.ICO_PIN,
+            # ---- 置顶标识：图钉 + 「置顶」胶囊徽章 ----
+            # 之前只画了一个 13px 的图钉字形，太细太淡，几乎看不见；
+            # 改成带品牌色底与描边的徽章，右对齐，一眼可辨。
+            bh = sc(BADGE_H)
+            bx = rc.right - sc(10) - sc(BADGE_W)
+            by = cy - bh // 2
+            br = _rc(bx, by, bx + sc(BADGE_W), by + bh)
+            cv.panel(br, sc(7),
+                     (p['brand'], 44),            # 底色：品牌色淡填充
+                     (p['brand'], 104))           # 1px 品牌色描边
+            text(cv.hdc, F['icon_md'], p['brand'],
+                 bx + sc(7), by, sc(17), bh, T.ICO_PIN,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+            text(cv.hdc, F['status_sb'], p['brand'],
+                 bx + sc(26), by, sc(BADGE_W) - sc(32), bh, "置顶",
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
     def _empty(self, cv, inner, p):
         g = self.app.g

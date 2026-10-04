@@ -191,6 +191,22 @@ WndProcType = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM
 
 
 # ============================== 结构体 ==============================
+class PAINTSTRUCT(ctypes.Structure):
+    """BeginPaint 的输出结构。
+
+    注意：x64 下 sizeof 是 72 字节（hdc 指针 8 + fErase 4 + 对齐 4 +
+    rcPaint 16 + fRestore 4 + fIncUpdate 4 + rgbReserved 32）。
+    之前用 `create_string_buffer(64)` 当缓冲区，BeginPaint 每次都会多写
+    8 字节，踩坏相邻的 Python 堆块 —— 表现为运行一会儿后在完全无关的
+    地方随机崩溃（调试分配器可稳定复现 "bad trailing pad byte"）。
+    """
+    _fields_ = [
+        ("hdc", wt.HDC), ("fErase", wt.BOOL), ("rcPaint", RECT),
+        ("fRestore", wt.BOOL), ("fIncUpdate", wt.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", WndProcType),
@@ -272,9 +288,9 @@ user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
 user32.GetClientRect.restype = wt.BOOL
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wt.BOOL
-user32.BeginPaint.argtypes = [wt.HWND, ctypes.c_void_p]
-user32.BeginPaint.restype = ctypes.c_void_p
-user32.EndPaint.argtypes = [wt.HWND, ctypes.c_void_p]
+user32.BeginPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.BeginPaint.restype = wt.HDC
+user32.EndPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 user32.SetForegroundWindow.argtypes = [wt.HWND]
@@ -1175,8 +1191,8 @@ class App:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def on_paint(self, hwnd):
-        ps = ctypes.create_string_buffer(64)
-        hdc = user32.BeginPaint(hwnd, ps)
+        ps = PAINTSTRUCT()
+        hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
         rc = RECT()
         user32.GetClientRect(hwnd, ctypes.byref(rc))
         w, h = max(1, rc.right), max(1, rc.bottom)
@@ -1188,7 +1204,7 @@ class App:
         except Exception:
             import traceback
             traceback.print_exc()
-        user32.EndPaint(hwnd, ps)
+        user32.EndPaint(hwnd, ctypes.byref(ps))
 
 
 # ============================== 入口 ==============================
@@ -1243,6 +1259,9 @@ def default_pos(w, h):
     sw = user32.GetSystemMetrics(0)
     sh = user32.GetSystemMetrics(1)
     return max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+
+
+_KEEP = []      # 保活引用（--shot 退出路径需要）
 
 
 def main():
@@ -1340,7 +1359,22 @@ def main():
         w, h = capture_window(hwnd, path)
         with open("_shot.log", "w") as f:
             f.write("saved %s %dx%d\n" % (path, w, h))
-        return
+        # 干净退出：不销毁窗口就 return 会让进程带着活动窗口/托盘图标结束，
+        # Windows 在收尾时会直接把进程打崩（退出码 139）。
+        user32.KillTimer(hwnd, 1)
+        user32.KillTimer(hwnd, 2)
+        user32.KillTimer(hwnd, 3)
+        user32.UnregisterHotKey(hwnd, HKID_TOGGLE)
+        user32.UnregisterHotKey(hwnd, HKID_SHOW)
+        tray_delete()
+        user32.DestroyWindow(hwnd)
+        # 窗口类还注册着的话，解释器退出时会因为回调过程已被回收而崩
+        _KEEP.append(app)                      # 保活，避免回调对象先被 GC
+        user32.UnregisterClassW(CLASS_NAME, ctypes.c_void_p(hinst))
+        # Python 的收尾阶段（GC ctypes 回调 + 卸载 DLL）在这类窗口场景下会崩，
+        # 直接退出进程，跳过收尾——日志与 PNG 都已落盘。
+        import os as _os
+        _os._exit(0)
 
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
