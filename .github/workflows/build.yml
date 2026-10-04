@@ -1,9 +1,16 @@
 name: Build & Release
 
-# 触发：推送到 main 自动构建并发布；也支持手动触发
+# 触发：推送到 main 自动构建并发布「新版本号的 Release」；也支持推 v* 标签与手动触发。
+#
+# 为什么不再固定发到 `latest` 那个 release：
+# GitHub 的 release 列表显示的是「首次发布日期」，复用一个固定标签去覆盖资源，
+# 页面上的日期永远是最初那一天，看起来像没更新（资源其实已经换了）。
+# 改成每次构建都递增一个版本号并新建 release，仓库首页的 Releases 就能看到
+# 当天的新版本，下载链接也仍然稳定（资产名固定不变）。
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 # 发布 release / 打 tag 需要写权限
@@ -16,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 需要读取全部 v* 标签来计算下一个版本号
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -53,12 +62,30 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico ontop.py
           copy dist\AlwaysOnTop_v2.exe release\AlwaysOnTop_v2.exe
 
+      # 版本号：推 v* 标签时用标签本身；main 推送时取现有最高 vX.Y 再加 1
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -e
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            LAST=$(git tag -l 'v[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            if [[ -z "$LAST" ]]; then
+              V="v1.0"
+            else
+              V="${LAST%.*}.$(( ${LAST##*.} + 1 ))"
+            fi
+          fi
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "本次发布版本：$V"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest build
-          prerelease: false
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: AlwaysOnTop ${{ steps.ver.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
