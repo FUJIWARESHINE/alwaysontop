@@ -1,13 +1,13 @@
-# PyInstaller 临时产物
+# 构建产物
+dist/
 build/
-__pycache__/
-*.pyc
+release/
 *.spec
 
-# 系统
-Thumbs.db
-Desktop.ini
-.DS_Store
+# 本地渲染验证产物（离屏渲染截图，非交付物）
+_preview/
 
-# 运行数据（如以后本地保存状态）
-*.log
+# 临时调试
+_err.log
+_out.log
+_*.py
