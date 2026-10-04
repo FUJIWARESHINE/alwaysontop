@@ -62,16 +62,9 @@ jobs:
       - name: Generate icons
         run: python gen_icon.py
 
-      # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
-      - name: Build exes
-        run: |
-          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop --icon icon.ico ontop.py
-          mkdir release
-          copy dist\AlwaysOnTop.exe release\AlwaysOnTop.exe
-          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico ontop.py
-          copy dist\AlwaysOnTop_v2.exe release\AlwaysOnTop_v2.exe
-
-      # 版本号：推 v* 标签时用标签本身；main 推送时取现有最高 vX.Y 再加 1
+      # 版本号：推 v* 标签时用标签本身；main 推送时取现有最高 vX.Y 再加 1。
+      # 必须在构建之前算出来 —— 版本号要写进 version.txt 打进 exe，
+      # 界面的状态栏会显示它，这样「用户手上跑的是哪一版」一眼可辨。
       - name: Resolve version
         id: ver
         shell: bash
@@ -87,8 +80,19 @@ jobs:
               V="${LAST%.*}.$(( ${LAST##*.} + 1 ))"
             fi
           fi
+          printf '%s' "$V" > version.txt
           echo "tag=$V" >> "$GITHUB_OUTPUT"
           echo "本次发布版本：$V"
+
+      # 构建两个 exe：AlwaysOnTop.exe（常规）与 AlwaysOnTop_v2.exe（改名破除图标缓存）
+      # --add-data 把 version.txt 一起打进去（onefile 会解到 sys._MEIPASS）
+      - name: Build exes
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop --icon icon.ico --add-data "version.txt;." ontop.py
+          mkdir release
+          copy dist\AlwaysOnTop.exe release\AlwaysOnTop.exe
+          pyinstaller --noconfirm --onefile --windowed --name AlwaysOnTop_v2 --icon icon.ico --add-data "version.txt;." ontop.py
+          copy dist\AlwaysOnTop_v2.exe release\AlwaysOnTop_v2.exe
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

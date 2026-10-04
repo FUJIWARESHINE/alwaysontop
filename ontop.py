@@ -17,6 +17,7 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import os
 import sys
 import time
 import winreg
@@ -380,7 +381,36 @@ dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
 
 
 # ============================== 全局状态 ==============================
+def app_version():
+    """读取构建时注入的版本号。
+
+    CI 在打包前会写一个 version.txt 并用 --add-data 打进 exe；
+    源码直接运行时读同目录下的 version.txt，读不到就回退成 dev。
+    状态栏会显示它 —— 这样「你手上跑的是哪一版」一眼可辨，
+    排查问题时不用再猜。
+    """
+    cands = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        cands.append(os.path.join(base, "version.txt"))
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        here = os.getcwd()
+    cands.append(os.path.join(here, "version.txt"))
+    for path in cands:
+        try:
+            with open(path, encoding="utf-8") as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except Exception:
+            continue
+    return "dev"
+
+
 g = {
+    'version': app_version(),
     'hwnd_main': None,
     'hwnd_search': None,
     'scale': 1.0,

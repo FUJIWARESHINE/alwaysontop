@@ -543,9 +543,12 @@ class UI:
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
              DT_NOPREFIX)
         sr = L['status_right']
+        right = "%d 个窗口" % len(g['rows'])
+        ver = g.get('version') or ''
+        if ver:
+            right += "   ·   " + ver      # 当前构建版本，方便确认跑的是哪一版
         text(cv.hdc, F['status_sb'], p['fg_dim'], sr.left, sr.top,
-             sr.right - sr.left, sr.bottom - sr.top,
-             "%d 个窗口" % len(g['rows']),
+             sr.right - sr.left, sr.bottom - sr.top, right,
              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 
     # ---------------------------------------------------- 菜单（浮层）
